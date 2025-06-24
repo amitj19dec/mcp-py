@@ -8,7 +8,7 @@ A basic calculator MCP (Model Context Protocol) server that provides arithmetic 
 - **Expression Evaluation**: Calculate mathematical expressions
 - **MCP Compliant**: Implements latest MCP specification with Streamable HTTP transport
 - **Containerized**: Ready for deployment in Docker containers
-- **Cloud Ready**: Suitable for Azure Container Instances and other cloud platforms
+
 
 ## Tools Available
 
@@ -29,35 +29,23 @@ A basic calculator MCP (Model Context Protocol) server that provides arithmetic 
 ## Quick Start
 
 ### Local Development (stdio transport)
-
 ```bash
-python calculator_mcp_server.py
+mcp dev calculator_mcp_server.py
 ```
-
-### Docker Development
-
+### MCP Inspector (local testing)
 ```bash
-# Build the image
-docker build -t calculator-mcp .
-
-# Run the container
-docker run -p 8000:8000 calculator-mcp
+npm install -g @modelcontextprotocol/inspector
+mcp-inspector
 ```
 
 ### Using Docker Compose
 
 ```bash
 # Start the service
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop the service
-docker-compose down
+docker-compose up --build
 ```
 
-## Azure Container Instance Deployment
+## Azure Container Instance Deployment (Not tested)
 
 ```bash
 # Build and push to Azure Container Registry
@@ -72,23 +60,28 @@ az container create \
   --environment-variables MCP_TRANSPORT=streamable-http MCP_PORT=8000 \
   --cpu 1 --memory 1
 ```
-
-## MCP Client Configuration
-
-For VS Code or other MCP clients, configure the server as:
-
-```json
-{
-  "servers": {
-    "calculator": {
-      "type": "streamable-http",
-      "url": "http://localhost:8000/mcp"
-    }
-  }
-}
+## MCP proxy
+```bash
+pipx install mcp-proxy
+mcp-proxy --help
+mcp-proxy --transport streamablehttp http://localhost:8000/mcp
 ```
 
-For cloud deployment:
+For Claude or other MCP clients, configure the server as:
+`
+```json
+{
+  "mcpServers": {
+    "calculator": {
+      "command": "/Users/amitj/.local/bin/mcp-proxy",
+      "args": ["--transport", "streamablehttp", "http://localhost:8000/mcp"]
+    }
+}
+```
+![alt text](image.png)
+
+
+For cloud deployment (Not tested):
 ```json
 {
   "servers": {
@@ -111,34 +104,3 @@ add(5, 3)
 calculate_expression("2 + 3 * 4")  
 # Returns: {"operation": "expression_evaluation", "expression": "2 + 3 * 4", "result": 14}
 ```
-
-## File Structure
-
-```
-.
-├── calculator_mcp_server.py    # Main MCP server implementation
-├── requirements.txt            # Python dependencies
-├── Dockerfile                  # Container definition
-├── docker-compose.yml          # Local deployment
-└── README.md                   # This file
-```
-
-## Security Notes
-
-- The `calculate_expression` function uses `eval()` for demonstration purposes only
-- In production, use a proper expression parser like `sympy` or `ast.literal_eval`
-- The server runs as non-root user in the container
-- Health checks are included for container orchestration
-
-## Environment Variables
-
-- `MCP_TRANSPORT`: Transport type (`stdio` or `streamable-http`)
-- `MCP_PORT`: Port number for HTTP transport (default: 8000)
-
-## Health Check
-
-The container includes a health check endpoint accessible at `/health` when running in HTTP mode.
-
-## License
-
-This is a demo implementation for educational purposes.
