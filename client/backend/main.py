@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simple MCP Client Backend for Demo
-Loads all MCP server details (tools, prompts, resources) on startup.
+MCP Client Backend with Chat Integration
+Loads all MCP server details and provides chat interface with dynamic tool calling.
 """
 
 import asyncio
@@ -13,9 +13,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 # FastMCP 2.0 imports
 from fastmcp import Client
+
+# Chat functionality
+from chat_handler import ChatHandler, ChatMessage, ChatResponse
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,9 +73,37 @@ class ToolResult(BaseModel):
 # Global storage for loaded server details
 server_details: Dict[str, ServerDetails] = {}
 mcp_clients: Dict[str, Client] = {}
+chat_handler: Optional[ChatHandler] = None
 
 # Configuration file path
-CONFIG_FILE_PATH = "../mcp_config.json"
+CONFIG_FILE_PATH = "/Users/amitj/Documents/code2.0/mcp-py/client/mcp_config.json"
+
+def initialize_chat_handler():
+    """Initialize Azure OpenAI chat handler."""
+    global chat_handler
+    
+    try:
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4")
+        
+        if not azure_endpoint or not api_key:
+            logger.warning("⚠️ Azure OpenAI credentials not found in environment. Chat functionality disabled.")
+            logger.info("💡 Create a .env file with AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
+            return
+        
+        chat_handler = ChatHandler(
+            azure_endpoint=azure_endpoint,
+            api_key=api_key,
+            api_version=api_version,
+            deployment_name=deployment_name
+        )
+        logger.info("✅ Chat handler initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize chat handler: {e}")
+        chat_handler = None
 
 def load_mcp_config() -> List[MCPServerConfig]:
     """Load MCP server configuration from JSON file."""
@@ -111,12 +146,9 @@ async def load_server_details(config: MCPServerConfig) -> ServerDetails:
         resources = []
         prompts = []
         
-        # Add debug logging to see what we're getting
         async with client as session:
             try:
                 tools_response = await session.list_tools()
-                logger.info(f"Tools response type: {type(tools_response)}")
-                logger.info(f"Tools response: {tools_response}")
                 
                 # Handle different response formats
                 if hasattr(tools_response, 'tools'):
@@ -222,6 +254,9 @@ async def load_all_servers():
     total_prompts = sum(len(details.prompts) for details in server_details.values())
     
     logger.info(f"📊 Summary: {len(server_details)} servers, {total_tools} tools, {total_resources} resources, {total_prompts} prompts")
+    
+    # Initialize chat handler after loading servers
+    initialize_chat_handler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -242,8 +277,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="MCP Client Backend - Demo",
-    description="Simple backend that loads all MCP server details on startup",
+    title="MCP Client Backend with Chat - Demo",
+    description="MCP backend with Azure OpenAI chat integration for dynamic tool calling",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -265,13 +300,61 @@ async def root():
     total_prompts = sum(len(details.prompts) for details in server_details.values())
     
     return {
-        "message": "MCP Client Backend - Demo",
+        "message": "MCP Client Backend with Chat - Demo",
         "servers_loaded": len(server_details),
         "total_tools": total_tools,
         "total_resources": total_resources,
         "total_prompts": total_prompts,
-        "server_names": list(server_details.keys())
+        "server_names": list(server_details.keys()),
+        "chat_available": chat_handler is not None
     }
+
+# === CHAT ENDPOINTS ===
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_llm(request: ChatMessage):
+    """Chat with LLM that can dynamically call MCP tools."""
+    if not chat_handler:
+        raise HTTPException(
+            status_code=503, 
+            detail="Chat functionality not available. Please check Azure OpenAI configuration."
+        )
+    
+    try:
+        # Get all available tools in the format needed for LLM
+        all_tools = []
+        for server_name, details in server_details.items():
+            for tool in details.tools:
+                tool_data = tool.dict()
+                tool_data["server"] = server_name
+                all_tools.append(tool_data)
+        
+        logger.info(f"🤖 Processing chat with {len(all_tools)} available tools")
+        
+        # Process chat with available tools
+        response = await chat_handler.chat_with_tools(
+            message=request.message,
+            available_tools=all_tools,
+            mcp_clients=mcp_clients
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"❌ Chat processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
+
+@app.get("/chat/status")
+async def chat_status():
+    """Check if chat functionality is available."""
+    return {
+        "chat_available": chat_handler is not None,
+        "azure_openai_configured": bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY")),
+        "deployment_name": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+        "tools_available": sum(len(details.tools) for details in server_details.values())
+    }
+
+# === SERVER MANAGEMENT ENDPOINTS ===
 
 @app.get("/servers", response_model=List[ServerDetails])
 async def get_all_servers():
@@ -342,6 +425,8 @@ async def call_tool(request: ToolCallRequest):
         logger.error(f"❌ Tool call failed: {e}")
         return ToolResult(success=False, error=str(e))
 
+# === CONFIGURATION ENDPOINTS ===
+
 @app.get("/config")
 async def get_config():
     """Get current MCP configuration."""
@@ -357,7 +442,7 @@ async def get_config():
 @app.post("/config/reload")
 async def reload_config():
     """Reload configuration from file and reconnect to servers."""
-    global server_details, mcp_clients
+    global server_details, mcp_clients, chat_handler
     
     logger.info("🔄 Reloading configuration from file...")
     
@@ -371,6 +456,7 @@ async def reload_config():
     # Clear storage
     server_details.clear()
     mcp_clients.clear()
+    chat_handler = None
     
     # Reload from config file
     await load_all_servers()
@@ -381,7 +467,8 @@ async def reload_config():
         "message": "Configuration reloaded from file", 
         "config_file": CONFIG_FILE_PATH,
         "servers_loaded": len(server_details),
-        "total_tools": total_tools
+        "total_tools": total_tools,
+        "chat_available": chat_handler is not None
     }
 
 @app.get("/health")
@@ -393,7 +480,8 @@ async def health_check():
         "status": "healthy",
         "servers_loaded": len(server_details),
         "healthy_servers": len(healthy_servers),
-        "server_status": {name: details.status for name, details in server_details.items()}
+        "server_status": {name: details.status for name, details in server_details.items()},
+        "chat_available": chat_handler is not None
     }
 
 if __name__ == "__main__":
