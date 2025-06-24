@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  calculator-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: calculator-mcp-server
+    ports:
+      - "8000:8000"
+    environment:
+      - MCP_TRANSPORT=streamable-http
+      - MCP_PORT=8000
+      - FASTMCP_HOST=0.0.0.0
+    restart: unless-stopped
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge
