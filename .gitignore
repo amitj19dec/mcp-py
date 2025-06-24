@@ -3,3 +3,4 @@ __pycache__
 .backendenv
 node_modules
 package-lock.json
+.vscode
