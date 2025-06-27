@@ -1,106 +1,104 @@
-# Calculator MCP Server
+# Authenticated Calculator MCP Server
 
-A basic calculator MCP (Model Context Protocol) server that provides arithmetic operations following the latest MCP specification (June 2025).
+This is a production-ready calculator MCP server with decoupled Azure AD authentication using the official MCP Python SDK.
 
-## Features
+## Architecture
 
-- **Basic Operations**: Add, subtract, multiply, divide
-- **Expression Evaluation**: Calculate mathematical expressions
-- **MCP Compliant**: Implements latest MCP specification with Streamable HTTP transport
-- **Containerized**: Ready for deployment in Docker containers
-
-
-## Tools Available
-
-1. **add(a, b)** - Add two numbers
-2. **subtract(a, b)** - Subtract b from a  
-3. **multiply(a, b)** - Multiply two numbers
-4. **divide(a, b)** - Divide a by b (handles division by zero)
-5. **calculate_expression(expression)** - Evaluate mathematical expressions
-
-## Resources
-
-- **calculator://info** - Get server capabilities information
-
-## Prompts
-
-- **math_helper** - A helpful prompt for math assistance
+- **auth_module.py**: Completely decoupled authentication logic
+- **calculator_mcp_server.py**: Original calculator server (unchanged)
+- **authenticated_calculator_server.py**: Main application that combines both
+- **Backward Compatible**: Can run with or without authentication
 
 ## Quick Start
 
-### Local Development (stdio transport)
-```bash
-mcp dev calculator_mcp_server.py
-```
-### MCP Inspector (local testing)
-```bash
-npm install -g @modelcontextprotocol/inspector
-mcp-inspector
-```
-
-### Using Docker Compose
+### 1. Setup Environment
 
 ```bash
-# Start the service
-docker-compose up --build
+# Copy environment template
+cp .env.example .env
+
+# Edit with your Azure AD values
+AZURE_TENANT_ID=your-tenant-id
+AZURE_CLIENT_ID=your-client-id
+MCP_SERVER_URL=https://your-server.com:8000
 ```
 
-## Azure Container Instance Deployment (Not tested)
+### 2. Install Dependencies
 
 ```bash
-# Build and push to Azure Container Registry
-az acr build --registry myregistry --image calculator-mcp:latest .
+pip install -r requirements.txt
+```
+
+### 3. Run the Server
+
+```bash
+# With authentication (default)
+python authenticated_calculator_server.py
+
+# Without authentication (original mode)
+ENABLE_AUTH=false python authenticated_calculator_server.py
+
+# Or use the original server directly
+python calculator_mcp_server.py
+```
+
+## Endpoints
+
+### Public Endpoints
+- `GET /health` - Health check
+- `GET /.well-known/oauth-protected-resource` - RFC 9728 metadata
+
+### Protected Endpoints (require Azure AD token)
+- `POST /mcp` - Main MCP endpoint for all tools/resources/prompts
+
+## Authentication Flow
+
+1. Client requests protected endpoint → 401 with WWW-Authenticate header
+2. Client fetches `/.well-known/oauth-protected-resource`
+3. Metadata points to Azure AD authorization server
+4. Client performs OAuth 2.1 flow with Azure AD
+5. Client includes Bearer token in subsequent requests
+
+## Docker Deployment
+
+```bash
+# Build image
+docker build -t calculator-mcp-auth .
+
+# Run locally
+docker run -p 8000:8000 \
+  -e AZURE_TENANT_ID=your-tenant-id \
+  -e AZURE_CLIENT_ID=your-client-id \
+  -e MCP_SERVER_URL=http://localhost:8000 \
+  calculator-mcp-auth
 
 # Deploy to Azure Container Instance
 az container create \
-  --resource-group myResourceGroup \
   --name calculator-mcp \
-  --image myregistry.azurecr.io/calculator-mcp:latest \
-  --ports 8000 \
-  --environment-variables MCP_TRANSPORT=streamable-http MCP_PORT=8000 \
-  --cpu 1 --memory 1
-```
-## MCP proxy
-```bash
-pipx install mcp-proxy
-mcp-proxy --help
-mcp-proxy --transport streamablehttp http://localhost:8000/mcp
+  --resource-group mygroup \
+  --image calculator-mcp-auth \
+  --environment-variables \
+    AZURE_TENANT_ID=$TENANT_ID \
+    AZURE_CLIENT_ID=$CLIENT_ID \
+    MCP_SERVER_URL=https://calculator.eastus.azurecontainer.io:8000 \
+  --ports 8000
 ```
 
-For Claude or other MCP clients, configure the server as:
-`
-```json
-{
-  "mcpServers": {
-    "calculator": {
-      "command": "/Users/amitj/.local/bin/mcp-proxy",
-      "args": ["--transport", "streamablehttp", "http://localhost:8000/mcp"]
-    }
-}
-```
-![alt text](image.png)
+## Configuration Options
 
+- `ENABLE_AUTH=true/false` - Enable/disable authentication
+- `AZURE_TENANT_ID` - Azure AD tenant ID
+- `AZURE_CLIENT_ID` - Azure AD application client ID  
+- `MCP_SERVER_URL` - Public URL of the server
+- `REQUIRED_SCOPES` - Comma-separated list of required scopes
+- `MCP_HOST/MCP_PORT` - Server bind address
 
-For cloud deployment (Not tested):
-```json
-{
-  "servers": {
-    "calculator": {
-      "type": "streamable-http", 
-      "url": "https://your-aci-instance.azurecontainer.io/mcp"
-    }
-  }
-}
-```
+## Features
 
-## API Examples
-
-When connected via MCP client, you can use:
-
-```
-add(5, 3)
-# Returns: {"operation": "addition", "operands": [5, 3], "result": 8, "expression": "5 + 3 = 8"}
-
-calculate_expression("2 + 3 * 4")  
-# Returns: {"operation": "expression_evaluation", "expression": "2 + 3 * 4", "result": 14}
-```
+- ✅ **Decoupled Architecture**: Auth and business logic completely separated
+- ✅ **Official SDK**: Uses `mcp[cli]>=1.9.4` with proper `TokenVerifier`
+- ✅ **RFC 9728 Compliant**: Protected Resource Metadata endpoint
+- ✅ **Azure AD Integration**: JWKS validation, scope checking
+- ✅ **Backward Compatible**: Can run with or without auth
+- ✅ **Production Ready**: Health checks, CORS, error handling
+- ✅ **Container Ready**: Docker support with health checks
