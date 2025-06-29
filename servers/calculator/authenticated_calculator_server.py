@@ -1,27 +1,91 @@
 """
-Enhanced Calculator MCP Server with Decoupled Azure AD Authentication
-Maintains the original calculator functionality while adding secure authentication.
+Enhanced Calculator MCP Server with Tool-Level RBAC
+Maintains the original calculator functionality while adding granular role-based access control.
 """
 
 import os
 import logging
 from typing import Any, Dict
 from datetime import datetime, timezone
+import asyncio
 
 # MCP SDK imports
 from mcp.server.fastmcp import FastMCP
 
 # FastAPI for hosting and middleware
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Authentication module (decoupled)
-from auth_module import AuthenticationManager, create_auth_config_from_env
+# Authentication module (decoupled with RBAC)
+from auth_module import (
+    AuthenticationManager, 
+    create_auth_config_from_env, 
+    create_rbac_policy_from_env,
+    RBACTokenVerifier
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class RBACProtectedMCP:
+    """
+    Wrapper for FastMCP that adds tool-level RBAC protection.
+    Completely decoupled from authentication logic.
+    """
+    
+    def __init__(self, mcp_instance: FastMCP, rbac_verifier: RBACTokenVerifier):
+        self.mcp = mcp_instance
+        self.rbac_verifier = rbac_verifier
+        self._original_tools = {}
+        self._wrap_tools_with_rbac()
+    
+    def _wrap_tools_with_rbac(self):
+        """Wrap all registered tools with RBAC authorization checks."""
+        # Store original tool implementations
+        for tool_name, tool_func in self.mcp._tools.items():
+            self._original_tools[tool_name] = tool_func
+            # Replace with RBAC-protected version
+            self.mcp._tools[tool_name] = self._create_protected_tool(tool_name, tool_func)
+        
+        logger.info(f"Wrapped {len(self._original_tools)} tools with RBAC protection")
+    
+    def _create_protected_tool(self, tool_name: str, original_func):
+        """Create an RBAC-protected version of a tool."""
+        async def protected_tool(*args, **kwargs):
+            # Get the current request token from context
+            # In a real implementation, this would be passed through the request context
+            token_info = getattr(asyncio.current_task(), 'token_info', None)
+            
+            if token_info is None:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="No authentication context found"
+                )
+            
+            # Check tool-level authorization
+            if not self.rbac_verifier.check_tool_authorization(tool_name, token_info):
+                # Get permission info for better error messages
+                rbac_engine = self.rbac_verifier.rbac_engine
+                permission_info = rbac_engine.get_permission_info(tool_name)
+                
+                error_detail = f"Insufficient permissions to execute tool '{tool_name}'"
+                if permission_info:
+                    error_detail += f". Required roles: {permission_info.required_roles}"
+                
+                raise HTTPException(status_code=403, detail=error_detail)
+            
+            # Execute original tool if authorized
+            logger.info(f"Authorized execution of tool '{tool_name}' for user with roles: {token_info.scopes}")
+            return await original_func(*args, **kwargs)
+        
+        # Preserve original function metadata
+        protected_tool.__name__ = original_func.__name__
+        protected_tool.__doc__ = original_func.__doc__
+        
+        return protected_tool
 
 
 class CalculatorMCPServer:
@@ -113,32 +177,70 @@ class CalculatorMCPServer:
         async def get_calculator_info() -> str:
             """Get information about the calculator server capabilities."""
             return """
-            Authenticated Calculator MCP Server Information
-            =============================================
+            RBAC-Protected Calculator MCP Server Information
+            ==============================================
             
             Authentication: Azure AD Bearer Token Required
+            Authorization: Role-Based Access Control (RBAC)
             
-            Available Operations:
-            - add(a, b): Add two numbers
-            - subtract(a, b): Subtract b from a  
-            - multiply(a, b): Multiply two numbers
-            - divide(a, b): Divide a by b (b cannot be zero)
-            - calculate_expression(expression): Evaluate a mathematical expression
+            Available Operations & Required Roles:
+            - add(a, b): Requires MCP.BasicUser role
+            - subtract(a, b): Requires MCP.BasicUser role
+            - multiply(a, b): Requires MCP.PowerUser role (inherits BasicUser)
+            - divide(a, b): Requires MCP.PowerUser role (inherits BasicUser)
+            - calculate_expression(expression): Requires MCP.Admin role (inherits all)
+            
+            Role Hierarchy:
+            - MCP.BasicUser: Basic arithmetic (add, subtract)
+            - MCP.PowerUser: Advanced arithmetic (includes basic + multiply, divide)
+            - MCP.Admin: All operations (includes power + expression evaluation)
             
             All operations return detailed results including the operation type,
             operands, result, and a formatted expression.
             
             Authentication Requirements:
             - Valid Azure AD bearer token in Authorization header
-            - Token must have MCP.User or MCP.Admin role
+            - Token must contain appropriate app roles for the requested operation
             - Token audience must match the configured client ID
             
             Example usage:
-            - add(5, 3) returns 8
-            - subtract(10, 4) returns 6
-            - multiply(7, 6) returns 42
-            - divide(15, 3) returns 5
-            - calculate_expression("2 + 3 * 4") returns 14
+            - add(5, 3) returns 8 [BasicUser+]
+            - multiply(7, 6) returns 42 [PowerUser+]
+            - calculate_expression("2 + 3 * 4") returns 14 [Admin only]
+            """
+
+        @self.mcp.resource("calculator://rbac")
+        async def get_rbac_info() -> str:
+            """Get RBAC configuration information."""
+            return """
+            Role-Based Access Control Configuration
+            =====================================
+            
+            This server implements granular RBAC with tool-level authorization.
+            
+            Azure AD App Registration Setup:
+            1. Server App Registration: Define app roles (MCP.BasicUser, MCP.PowerUser, MCP.Admin)
+            2. Client App Registration: Request API permissions for server app roles
+            3. Admin Consent: Grant permissions at tenant level
+            4. Token Request: Use api://server-app-id/.default scope
+            
+            Token Validation:
+            - JWT signature validation against Azure AD JWKS
+            - Audience validation (must match server app ID)
+            - Role extraction from 'roles' claim
+            - Tool-level authorization check before execution
+            
+            Role Inheritance:
+            - Higher roles automatically inherit lower role permissions
+            - Admin can execute all tools
+            - PowerUser can execute basic and power tools
+            - BasicUser can only execute basic tools
+            
+            For access issues, check:
+            1. Token contains required roles in 'roles' claim
+            2. App registration has correct API permissions
+            3. Admin consent has been granted
+            4. Client is using correct audience scope
             """
 
     def _setup_prompts(self):
@@ -148,17 +250,24 @@ class CalculatorMCPServer:
         async def math_helper_prompt() -> str:
             """A prompt template for helping with math problems."""
             return """
-            I'm an authenticated calculator assistant that can help you with basic arithmetic operations.
+            I'm an RBAC-protected calculator assistant with role-based operation access.
             
-            Authentication: This server requires a valid Azure AD bearer token.
+            Authentication: This server requires a valid Azure AD bearer token with appropriate roles.
             
-            I can perform the following operations:
+            Available Operations by Role:
+            
+            🔰 MCP.BasicUser:
             1. Addition: add(a, b)
             2. Subtraction: subtract(a, b)
+            
+            ⚡ MCP.PowerUser (includes BasicUser):
             3. Multiplication: multiply(a, b)  
             4. Division: divide(a, b)
+            
+            👑 MCP.Admin (includes all):
             5. Expression evaluation: calculate_expression("expression")
             
+            Your access level depends on the roles in your Azure AD token.
             What mathematical operation would you like me to perform?
             Please provide the numbers or expression you'd like me to calculate.
             """
@@ -169,21 +278,30 @@ class CalculatorMCPServer:
 
 
 class AuthenticatedCalculatorApp:
-    """Main application that composes authentication and MCP server."""
+    """Main application that composes authentication, RBAC, and MCP server."""
     
     def __init__(self):
         # Load authentication configuration
         self.auth_config = create_auth_config_from_env()
-        self.auth_manager = AuthenticationManager(self.auth_config)
+        self.rbac_engine = create_rbac_policy_from_env()
+        self.auth_manager = AuthenticationManager(self.auth_config, self.rbac_engine)
         
         # Initialize calculator server
-        self.calculator_server = CalculatorMCPServer("Authenticated Calculator")
+        self.calculator_server = CalculatorMCPServer("RBAC-Protected Calculator")
+        
+        # Wrap MCP server with RBAC protection
+        rbac_verifier = self.auth_manager.get_rbac_verifier()
+        self.protected_mcp = RBACProtectedMCP(
+            self.calculator_server.get_fastmcp_instance(), 
+            rbac_verifier
+        )
+        
         self._configure_mcp_auth()
         
         # Initialize FastAPI app
         self.app = FastAPI(
-            title="Authenticated Calculator MCP Server",
-            description="A secure calculator MCP server with Azure AD authentication"
+            title="RBAC-Protected Calculator MCP Server",
+            description="A secure calculator MCP server with Azure AD authentication and role-based access control"
         )
         self._setup_fastapi()
 
@@ -207,11 +325,31 @@ class AuthenticatedCalculatorApp:
             allow_headers=["*"],
         )
         
-        # RFC 9728 Protected Resource Metadata endpoint
+        # RFC 9728 Protected Resource Metadata endpoint (enhanced with RBAC info)
         @self.app.get("/.well-known/oauth-protected-resource")
         async def protected_resource_metadata():
-            """RFC 9728 Protected Resource Metadata endpoint."""
+            """RFC 9728 Protected Resource Metadata endpoint with RBAC information."""
             return self.auth_manager.get_protected_resource_metadata()
+        
+        # RBAC authorization info endpoint
+        @self.app.get("/auth/info")
+        async def auth_info(request: Request):
+            """Get user's authorization information and accessible tools."""
+            auth_header = request.headers.get("Authorization")
+            if not auth_header or not auth_header.startswith("Bearer "):
+                raise HTTPException(status_code=401, detail="Bearer token required")
+            
+            token = auth_header.split(" ", 1)[1]
+            rbac_verifier = self.auth_manager.get_rbac_verifier()
+            
+            try:
+                token_info = await rbac_verifier.verify_token(token)
+                auth_context = rbac_verifier.get_authorization_context(token_info)
+                return auth_context
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
         
         # Health check endpoint (no auth required)
         @self.app.get("/health")
@@ -219,15 +357,17 @@ class AuthenticatedCalculatorApp:
             """Health check endpoint for monitoring."""
             return {
                 "status": "healthy",
-                "service": "Authenticated Calculator MCP Server",
-                "authentication": "Azure AD",
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "service": "RBAC-Protected Calculator MCP Server",
+                "authentication": "Azure AD with RBAC",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "rbac_enabled": True,
+                "supported_roles": list(self.rbac_engine.role_hierarchy.keys())
             }
         
-        # Authentication middleware for MCP endpoints
+        # Authentication middleware for MCP endpoints with token context injection
         @self.app.middleware("http")
         async def auth_middleware(request: Request, call_next):
-            """Authentication middleware for MCP requests."""
+            """Authentication middleware for MCP requests with RBAC context."""
             # Skip auth for public endpoints
             public_paths = [
                 "/health", 
@@ -257,8 +397,43 @@ class AuthenticatedCalculatorApp:
                     }
                 )
             
-            # The MCP SDK TokenVerifier will handle token validation automatically
-            return await call_next(request)
+            # Validate token and inject into request context
+            token = auth_header.split(" ", 1)[1]
+            rbac_verifier = self.auth_manager.get_rbac_verifier()
+            
+            try:
+                token_info = await rbac_verifier.verify_token(token)
+                
+                # Inject token info into asyncio context for tool access
+                current_task = asyncio.current_task()
+                if current_task:
+                    current_task.token_info = token_info
+                
+                response = await call_next(request)
+                
+                # Clean up context
+                if current_task and hasattr(current_task, 'token_info'):
+                    delattr(current_task, 'token_info')
+                
+                return response
+                
+            except HTTPException as e:
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content={"error": "Authentication failed", "detail": e.detail},
+                    headers={
+                        "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"'
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Authentication error: {str(e)}")
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Authentication failed", "detail": "Token validation error"},
+                    headers={
+                        "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"'
+                    }
+                )
         
         # Mount the MCP server
         mcp_app = self.calculator_server.get_fastmcp_instance()
@@ -302,19 +477,22 @@ if __name__ == "__main__":
     auth_enabled = os.getenv("ENABLE_AUTH", "true").lower() == "true"
     
     if auth_enabled and os.getenv("AZURE_TENANT_ID") and os.getenv("AZURE_CLIENT_ID"):
-        # Run with authentication
+        # Run with authentication and RBAC
         import uvicorn
         
         host = os.getenv("MCP_HOST", "0.0.0.0")
         port = int(os.getenv("MCP_PORT", "8000"))
         
-        logger.info("Starting Authenticated Calculator MCP Server...")
+        logger.info("Starting RBAC-Protected Calculator MCP Server...")
         logger.info(f"Host: {host}")
         logger.info(f"Port: {port}")
         logger.info("Authentication: Azure AD Bearer Token Required")
+        logger.info("Authorization: Role-Based Access Control (RBAC)")
+        logger.info("Supported Roles: MCP.BasicUser, MCP.PowerUser, MCP.Admin")
         logger.info("Endpoints available:")
         logger.info(f"  - Health check: http://{host}:{port}/health")
         logger.info(f"  - Protected Resource Metadata: http://{host}:{port}/.well-known/oauth-protected-resource")
+        logger.info(f"  - Authorization Info: http://{host}:{port}/auth/info")
         logger.info(f"  - MCP endpoint: http://{host}:{port}/mcp")
         
         app = create_app()
