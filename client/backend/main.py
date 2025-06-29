@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MCP Client Backend with Chat Integration
-Loads all MCP server details and provides chat interface with dynamic tool calling.
+Enhanced MCP Client Backend with Authentication Support
+Loads all MCP server details with Azure AD authentication and provides chat interface with RBAC-aware tool calling.
 """
 
 import asyncio
@@ -15,10 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# FastMCP 2.0 imports
-from fastmcp import Client
+# Enhanced MCP client with authentication
+from enhanced_mcp_client import EnhancedMCPClient, create_enhanced_mcp_client
+from auth_client import AuthConfig, parse_auth_config_from_dict
 
-# Chat functionality
+# Chat functionality (enhanced to work with authenticated clients)
 from chat_handler import ChatHandler, ChatMessage, ChatResponse
 
 # Load environment variables
@@ -33,32 +34,39 @@ class MCPServerConfig(BaseModel):
     name: str
     url: str
     description: str = ""
+    auth: Optional[Dict[str, Any]] = None
 
 class ToolInfo(BaseModel):
     name: str
     description: str
     title: Optional[str] = None
     input_schema: Dict[str, Any] = {}
-    annotations: Optional[Dict[str, Any]] = None  # Allow None
+    annotations: Optional[Dict[str, Any]] = None
+    server: str = ""
+    accessible: bool = True
 
 class ResourceInfo(BaseModel):
     uri: str
     name: str
     description: str = ""
     mime_type: str = ""
+    server: str = ""
 
 class PromptInfo(BaseModel):
     name: str
     description: str = ""
     arguments: List[Dict[str, Any]] = []
+    server: str = ""
 
 class ServerDetails(BaseModel):
     name: str
     description: str
     status: str
+    auth_required: bool = False
     tools: List[ToolInfo] = []
     resources: List[ResourceInfo] = []
     prompts: List[PromptInfo] = []
+    auth_context: Dict[str, Any] = {}
 
 class ToolCallRequest(BaseModel):
     server_name: str
@@ -69,10 +77,19 @@ class ToolResult(BaseModel):
     success: bool
     result: Any = None
     error: Optional[str] = None
+    permission_denied: bool = False
 
-# Global storage for loaded server details
+class AuthStatusResponse(BaseModel):
+    server_name: str
+    auth_required: bool
+    status: str
+    accessible_tools: List[str] = []
+    user_roles: List[str] = []
+    error: Optional[str] = None
+
+# Global storage for enhanced MCP clients and server details
+enhanced_clients: Dict[str, EnhancedMCPClient] = {}
 server_details: Dict[str, ServerDetails] = {}
-mcp_clients: Dict[str, Client] = {}
 chat_handler: Optional[ChatHandler] = None
 
 # Configuration file path
@@ -106,7 +123,7 @@ def initialize_chat_handler():
         chat_handler = None
 
 def load_mcp_config() -> List[MCPServerConfig]:
-    """Load MCP server configuration from JSON file."""
+    """Load MCP server configuration from JSON file with auth support."""
     try:
         if not os.path.exists(CONFIG_FILE_PATH):
             logger.error(f"Config file not found: {CONFIG_FILE_PATH}")
@@ -120,7 +137,8 @@ def load_mcp_config() -> List[MCPServerConfig]:
             servers.append(MCPServerConfig(
                 name=server_config['name'],
                 url=server_config['url'],
-                description=server_config.get('description', '')
+                description=server_config.get('description', ''),
+                auth=server_config.get('auth', None)
             ))
         
         logger.info(f"📄 Loaded {len(servers)} server configs from {CONFIG_FILE_PATH}")
@@ -131,95 +149,93 @@ def load_mcp_config() -> List[MCPServerConfig]:
         return []
 
 async def load_server_details(config: MCPServerConfig) -> ServerDetails:
-    """Load complete server details - tools, resources, prompts."""
+    """Load complete server details with authentication support."""
     try:
-        logger.info(f"Loading details for {config.name}...")
+        logger.info(f"Loading details for {config.name} with auth support...")
         
-        # Connect to MCP server using FastMCP 2.0 pattern
-        client = Client(config.url)
+        # Create enhanced MCP client
+        client = create_enhanced_mcp_client(config.dict())
+        enhanced_clients[config.name] = client
         
-        # Store client for later use
-        mcp_clients[config.name] = client
+        # Initialize client and test connection
+        await client.initialize()
+        connection_status = await client.test_connection()
         
-        # Get tools using FastMCP 2.0 context manager
+        if connection_status["status"] != "connected":
+            logger.warning(f"Failed to connect to {config.name}: {connection_status.get('error', 'Unknown error')}")
+            return ServerDetails(
+                name=config.name,
+                description=config.description,
+                status="error",
+                auth_required=connection_status.get("auth_required", False),
+                tools=[],
+                resources=[],
+                prompts=[],
+                auth_context={}
+            )
+        
+        # Get server capabilities with permission filtering
+        capabilities = await client.get_server_capabilities()
+        auth_context = await client.get_authorization_context()
+        
+        # Convert tools with accessibility info
         tools = []
-        resources = []
-        prompts = []
+        accessible_tools = auth_context.get("accessible_tools", [])
+        for tool in capabilities.get("tools", []):
+            tool_name = tool.get("name", "")
+            is_accessible = not accessible_tools or tool_name in accessible_tools
+            
+            tools.append(ToolInfo(
+                name=tool_name,
+                description=tool.get("description", ""),
+                title=tool.get("title", tool_name),
+                input_schema=tool.get("input_schema", {}),
+                annotations=tool.get("annotations", {}),
+                server=config.name,
+                accessible=is_accessible
+            ))
         
-        async with client as session:
-            try:
-                tools_response = await session.list_tools()
-                
-                # Handle different response formats
-                if hasattr(tools_response, 'tools'):
-                    tools_list = tools_response.tools
-                elif isinstance(tools_response, list):
-                    tools_list = tools_response
-                else:
-                    tools_list = []
-                    
-                for tool in tools_list:
-                    tools.append(ToolInfo(
-                        name=tool.name,
-                        description=tool.description or "",
-                        title=getattr(tool, 'title', tool.name),
-                        input_schema=tool.inputSchema or {},
-                        annotations=getattr(tool, 'annotations', None) or {}  # Handle None
-                    ))
-            except Exception as e:
-                logger.warning(f"Could not load tools from {config.name}: {e}")
-            
-            # Get resources
-            try:
-                resources_response = await session.list_resources()
-                # Handle different response formats
-                if hasattr(resources_response, 'resources'):
-                    resources_list = resources_response.resources
-                elif isinstance(resources_response, list):
-                    resources_list = resources_response
-                else:
-                    resources_list = []
-                    
-                for resource in resources_list:
-                    resources.append(ResourceInfo(
-                        uri=str(resource.uri),  # Convert to string
-                        name=resource.name or str(resource.uri),
-                        description=resource.description or "",
-                        mime_type=resource.mimeType or ""
-                    ))
-            except Exception as e:
-                logger.warning(f"Could not load resources from {config.name}: {e}")
-            
-            # Get prompts
-            try:
-                prompts_response = await session.list_prompts()
-                # Handle different response formats
-                if hasattr(prompts_response, 'prompts'):
-                    prompts_list = prompts_response.prompts
-                elif isinstance(prompts_response, list):
-                    prompts_list = prompts_response
-                else:
-                    prompts_list = []
-                    
-                for prompt in prompts_list:
-                    prompts.append(PromptInfo(
-                        name=prompt.name,
-                        description=prompt.description or "",
-                        arguments=prompt.arguments or []
-                    ))
-            except Exception as e:
-                logger.warning(f"Could not load prompts from {config.name}: {e}")
+        # Convert resources
+        resources = []
+        for resource in capabilities.get("resources", []):
+            resources.append(ResourceInfo(
+                uri=resource.get("uri", ""),
+                name=resource.get("name", ""),
+                description=resource.get("description", ""),
+                mime_type=resource.get("mime_type", ""),
+                server=config.name
+            ))
+        
+        # Convert prompts
+        prompts = []
+        for prompt in capabilities.get("prompts", []):
+            prompts.append(PromptInfo(
+                name=prompt.get("name", ""),
+                description=prompt.get("description", ""),
+                arguments=prompt.get("arguments", []),
+                server=config.name
+            ))
         
         details = ServerDetails(
             name=config.name,
             description=config.description,
             status="connected",
+            auth_required=capabilities.get("auth_required", False),
             tools=tools,
             resources=resources,
-            prompts=prompts
+            prompts=prompts,
+            auth_context=auth_context
         )
         
-        logger.info(f"✅ Loaded {config.name}: {len(tools)} tools, {len(resources)} resources, {len(prompts)} prompts")
+        accessible_count = len([t for t in tools if t.accessible])
+        logger.info(f"✅ Loaded {config.name}: {accessible_count}/{len(tools)} accessible tools, "
+                   f"{len(resources)} resources, {len(prompts)} prompts")
+        
+        if auth_context:
+            user_roles = auth_context.get("user_roles", [])
+            if user_roles:
+                logger.info(f"🔐 User roles for {config.name}: {user_roles}")
+        
         return details
         
     except Exception as e:
@@ -228,14 +244,16 @@ async def load_server_details(config: MCPServerConfig) -> ServerDetails:
             name=config.name,
             description=config.description,
             status="error",
+            auth_required=True,  # Assume auth required if loading failed
             tools=[],
             resources=[],
-            prompts=[]
+            prompts=[],
+            auth_context={}
         )
 
 async def load_all_servers():
-    """Load details from all configured MCP servers."""
-    logger.info("🚀 Loading all MCP server details...")
+    """Load details from all configured MCP servers with authentication."""
+    logger.info("🚀 Loading all MCP server details with authentication support...")
     
     # Load configuration from JSON file
     mcp_servers = load_mcp_config()
@@ -250,10 +268,14 @@ async def load_all_servers():
     
     # Summary
     total_tools = sum(len(details.tools) for details in server_details.values())
+    accessible_tools = sum(len([t for t in details.tools if t.accessible]) for details in server_details.values())
     total_resources = sum(len(details.resources) for details in server_details.values())
     total_prompts = sum(len(details.prompts) for details in server_details.values())
+    auth_servers = len([d for d in server_details.values() if d.auth_required])
     
-    logger.info(f"📊 Summary: {len(server_details)} servers, {total_tools} tools, {total_resources} resources, {total_prompts} prompts")
+    logger.info(f"📊 Summary: {len(server_details)} servers ({auth_servers} with auth), "
+               f"{accessible_tools}/{total_tools} accessible tools, "
+               f"{total_resources} resources, {total_prompts} prompts")
     
     # Initialize chat handler after loading servers
     initialize_chat_handler()
@@ -268,18 +290,13 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("🧹 Cleaning up connections...")
-    for client in mcp_clients.values():
-        try:
-            # FastMCP 2.0 clients handle cleanup automatically
-            pass
-        except Exception as e:
-            logger.warning(f"Error during cleanup: {e}")
+    enhanced_clients.clear()
 
 # Create FastAPI app
 app = FastAPI(
-    title="MCP Client Backend with Chat - Demo",
-    description="MCP backend with Azure OpenAI chat integration for dynamic tool calling",
-    version="1.0.0",
+    title="Enhanced MCP Client Backend with Authentication",
+    description="MCP backend with Azure AD authentication support and RBAC-aware chat integration",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -294,15 +311,20 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    """Root endpoint with summary."""
+    """Root endpoint with summary including auth information."""
     total_tools = sum(len(details.tools) for details in server_details.values())
+    accessible_tools = sum(len([t for t in details.tools if t.accessible]) for details in server_details.values())
     total_resources = sum(len(details.resources) for details in server_details.values())
     total_prompts = sum(len(details.prompts) for details in server_details.values())
+    auth_enabled_servers = [name for name, details in server_details.items() if details.auth_required]
     
     return {
-        "message": "MCP Client Backend with Chat - Demo",
+        "message": "Enhanced MCP Client Backend with Authentication",
         "servers_loaded": len(server_details),
+        "auth_enabled_servers": len(auth_enabled_servers),
+        "auth_server_names": auth_enabled_servers,
         "total_tools": total_tools,
+        "accessible_tools": accessible_tools,
         "total_resources": total_resources,
         "total_prompts": total_prompts,
         "server_names": list(server_details.keys()),
@@ -313,7 +335,7 @@ async def root():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatMessage):
-    """Chat with LLM that can dynamically call MCP tools."""
+    """Chat with LLM that can dynamically call accessible MCP tools with auth support."""
     if not chat_handler:
         raise HTTPException(
             status_code=503, 
@@ -321,21 +343,21 @@ async def chat_with_llm(request: ChatMessage):
         )
     
     try:
-        # Get all available tools in the format needed for LLM
+        # Get all accessible tools in the format needed for LLM
         all_tools = []
         for server_name, details in server_details.items():
             for tool in details.tools:
-                tool_data = tool.dict()
-                tool_data["server"] = server_name
-                all_tools.append(tool_data)
+                if tool.accessible:  # Only include accessible tools
+                    tool_data = tool.dict()
+                    all_tools.append(tool_data)
         
-        logger.info(f"🤖 Processing chat with {len(all_tools)} available tools")
+        logger.info(f"🤖 Processing chat with {len(all_tools)} accessible tools")
         
-        # Process chat with available tools
-        response = await chat_handler.chat_with_tools(
+        # Process chat with available tools (enhanced chat handler will handle auth)
+        response = await chat_handler.chat_with_tools_auth(
             message=request.message,
             available_tools=all_tools,
-            mcp_clients=mcp_clients
+            enhanced_clients=enhanced_clients
         )
         
         return response
@@ -346,24 +368,104 @@ async def chat_with_llm(request: ChatMessage):
 
 @app.get("/chat/status")
 async def chat_status():
-    """Check if chat functionality is available."""
+    """Check if chat functionality is available with auth information."""
+    accessible_tools = sum(len([t for t in details.tools if t.accessible]) for details in server_details.values())
+    auth_servers = [name for name, details in server_details.items() if details.auth_required]
+    
     return {
         "chat_available": chat_handler is not None,
         "azure_openai_configured": bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY")),
         "deployment_name": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
-        "tools_available": sum(len(details.tools) for details in server_details.values())
+        "tools_available": accessible_tools,
+        "auth_enabled_servers": len(auth_servers),
+        "auth_server_names": auth_servers
     }
+
+# === AUTHENTICATION ENDPOINTS ===
+
+@app.get("/auth/status", response_model=List[AuthStatusResponse])
+async def get_auth_status():
+    """Get authentication status for all servers."""
+    status_list = []
+    
+    for server_name, client in enhanced_clients.items():
+        try:
+            connection_status = await client.test_connection()
+            auth_context = await client.get_authorization_context()
+            
+            status_list.append(AuthStatusResponse(
+                server_name=server_name,
+                auth_required=client.auth_config.auth_type != "none",
+                status=connection_status["status"],
+                accessible_tools=auth_context.get("accessible_tools", []),
+                user_roles=auth_context.get("user_roles", []),
+                error=connection_status.get("error")
+            ))
+            
+        except Exception as e:
+            status_list.append(AuthStatusResponse(
+                server_name=server_name,
+                auth_required=True,
+                status="error",
+                error=str(e)
+            ))
+    
+    return status_list
+
+@app.post("/auth/refresh/{server_name}")
+async def refresh_server_auth(server_name: str):
+    """Refresh authentication for a specific server."""
+    if server_name not in enhanced_clients:
+        raise HTTPException(404, f"Server {server_name} not found")
+    
+    try:
+        client = enhanced_clients[server_name]
+        await client.refresh_auth()
+        
+        # Reload server details
+        config_data = load_mcp_config()
+        server_config = next((s for s in config_data if s.name == server_name), None)
+        if server_config:
+            new_details = await load_server_details(server_config)
+            server_details[server_name] = new_details
+        
+        return {"message": f"Authentication refreshed for {server_name}", "status": "success"}
+        
+    except Exception as e:
+        logger.error(f"Failed to refresh auth for {server_name}: {e}")
+        raise HTTPException(500, f"Failed to refresh authentication: {str(e)}")
+
+@app.get("/auth/context/{server_name}")
+async def get_server_auth_context(server_name: str):
+    """Get detailed authentication context for a server."""
+    if server_name not in enhanced_clients:
+        raise HTTPException(404, f"Server {server_name} not found")
+    
+    try:
+        client = enhanced_clients[server_name]
+        auth_context = await client.get_authorization_context(force_refresh=True)
+        
+        return {
+            "server_name": server_name,
+            "auth_context": auth_context,
+            "auth_type": client.auth_config.auth_type,
+            "scope": client.auth_config.scope
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get auth context for {server_name}: {e}")
+        raise HTTPException(500, f"Failed to get authentication context: {str(e)}")
 
 # === SERVER MANAGEMENT ENDPOINTS ===
 
 @app.get("/servers", response_model=List[ServerDetails])
 async def get_all_servers():
-    """Get all loaded server details (tools, resources, prompts)."""
+    """Get all loaded server details with authentication information."""
     return list(server_details.values())
 
 @app.get("/servers/{server_name}", response_model=ServerDetails)
 async def get_server_details(server_name: str):
-    """Get specific server details."""
+    """Get specific server details with auth context."""
     if server_name not in server_details:
         raise HTTPException(404, f"Server {server_name} not found")
     
@@ -371,56 +473,66 @@ async def get_server_details(server_name: str):
 
 @app.get("/tools")
 async def get_all_tools():
-    """Get all tools from all servers."""
+    """Get all accessible tools from all servers."""
     all_tools = []
     for server_name, details in server_details.items():
         for tool in details.tools:
-            tool_data = tool.dict()
-            tool_data["server"] = server_name
-            all_tools.append(tool_data)
+            if tool.accessible:  # Only include accessible tools
+                all_tools.append(tool.dict())
     
     return {"tools": all_tools, "total": len(all_tools)}
 
-@app.get("/resources")
-async def get_all_resources():
-    """Get all resources from all servers."""
-    all_resources = []
-    for server_name, details in server_details.items():
-        for resource in details.resources:
-            resource_data = resource.dict()
-            resource_data["server"] = server_name
-            all_resources.append(resource_data)
+@app.get("/tools/accessible/{server_name}")
+async def get_accessible_tools(server_name: str):
+    """Get tools accessible to the current user for a specific server."""
+    if server_name not in enhanced_clients:
+        raise HTTPException(404, f"Server {server_name} not found")
     
-    return {"resources": all_resources, "total": len(all_resources)}
-
-@app.get("/prompts")
-async def get_all_prompts():
-    """Get all prompts from all servers."""
-    all_prompts = []
-    for server_name, details in server_details.items():
-        for prompt in details.prompts:
-            prompt_data = prompt.dict()
-            prompt_data["server"] = server_name
-            all_prompts.append(prompt_data)
-    
-    return {"prompts": all_prompts, "total": len(all_prompts)}
+    try:
+        client = enhanced_clients[server_name]
+        accessible_tools = await client.get_accessible_tools()
+        
+        return {
+            "server_name": server_name,
+            "accessible_tools": accessible_tools,
+            "total": len(accessible_tools)
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get accessible tools for {server_name}: {e}")
+        raise HTTPException(500, f"Failed to get accessible tools: {str(e)}")
 
 @app.post("/tools/call", response_model=ToolResult)
 async def call_tool(request: ToolCallRequest):
-    """Execute a tool on the specified server."""
-    if request.server_name not in mcp_clients:
+    """Execute a tool on the specified server with authentication and authorization."""
+    if request.server_name not in enhanced_clients:
         raise HTTPException(404, f"Server {request.server_name} not connected")
     
     try:
-        client = mcp_clients[request.server_name]
+        client = enhanced_clients[request.server_name]
         
-        # Use FastMCP 2.0 context manager for tool calls
-        async with client as session:
-            result = await session.call_tool(request.tool_name, request.arguments)
-            
-            logger.info(f"✅ Tool call: {request.server_name}.{request.tool_name}")
-            return ToolResult(success=True, result=str(result))
+        # Check permission first
+        has_permission = await client.check_tool_permission(request.tool_name)
+        if not has_permission:
+            return ToolResult(
+                success=False,
+                error=f"Permission denied for tool '{request.tool_name}'",
+                permission_denied=True
+            )
         
+        # Execute tool with auth
+        result = await client.call_tool_with_auth(request.tool_name, request.arguments)
+        
+        logger.info(f"✅ Tool call: {request.server_name}.{request.tool_name}")
+        return ToolResult(success=True, result=result)
+        
+    except PermissionError as e:
+        logger.warning(f"🚫 Permission denied: {request.server_name}.{request.tool_name}")
+        return ToolResult(
+            success=False,
+            error=str(e),
+            permission_denied=True
+        )
     except Exception as e:
         logger.error(f"❌ Tool call failed: {e}")
         return ToolResult(success=False, error=str(e))
@@ -429,58 +541,65 @@ async def call_tool(request: ToolCallRequest):
 
 @app.get("/config")
 async def get_config():
-    """Get current MCP configuration."""
+    """Get current MCP configuration with auth information."""
     try:
         mcp_servers = load_mcp_config()
+        config_with_auth = []
+        
+        for server in mcp_servers:
+            server_dict = server.dict()
+            # Mask sensitive information
+            if server_dict.get("auth") and server_dict["auth"].get("client_secret"):
+                server_dict["auth"]["client_secret"] = "***masked***"
+            config_with_auth.append(server_dict)
+        
         return {
             "config_file": CONFIG_FILE_PATH,
-            "servers": [server.dict() for server in mcp_servers]
+            "servers": config_with_auth
         }
     except Exception as e:
         raise HTTPException(500, f"Error loading config: {str(e)}")
 
 @app.post("/config/reload")
 async def reload_config():
-    """Reload configuration from file and reconnect to servers."""
-    global server_details, mcp_clients, chat_handler
+    """Reload configuration from file and reconnect to servers with auth."""
+    global server_details, enhanced_clients, chat_handler
     
-    logger.info("🔄 Reloading configuration from file...")
+    logger.info("🔄 Reloading configuration from file with auth support...")
     
-    # Clear existing clients
-    for client in mcp_clients.values():
-        try:
-            pass  # FastMCP 2.0 handles cleanup automatically
-        except:
-            pass
-    
-    # Clear storage
+    # Clear existing clients and storage
+    enhanced_clients.clear()
     server_details.clear()
-    mcp_clients.clear()
     chat_handler = None
     
     # Reload from config file
     await load_all_servers()
     
-    total_tools = sum(len(details.tools) for details in server_details.values())
+    accessible_tools = sum(len([t for t in details.tools if t.accessible]) for details in server_details.values())
+    auth_servers = len([d for d in server_details.values() if d.auth_required])
     
     return {
-        "message": "Configuration reloaded from file", 
+        "message": "Configuration reloaded from file with authentication support", 
         "config_file": CONFIG_FILE_PATH,
         "servers_loaded": len(server_details),
-        "total_tools": total_tools,
+        "auth_enabled_servers": auth_servers,
+        "accessible_tools": accessible_tools,
         "chat_available": chat_handler is not None
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with authentication status."""
     healthy_servers = [name for name, details in server_details.items() if details.status == "connected"]
+    auth_servers = [name for name, details in server_details.items() if details.auth_required]
     
     return {
         "status": "healthy",
         "servers_loaded": len(server_details),
         "healthy_servers": len(healthy_servers),
+        "auth_enabled_servers": len(auth_servers),
         "server_status": {name: details.status for name, details in server_details.items()},
+        "auth_status": {name: details.auth_required for name, details in server_details.items()},
         "chat_available": chat_handler is not None
     }
 
