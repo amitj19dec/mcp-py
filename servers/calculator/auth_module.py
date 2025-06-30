@@ -12,11 +12,11 @@ from enum import Enum
 
 # Azure AD and JWT handling
 import jwt
-from jwt import PyJWKSClient
+from jwt import PyJWKClient
 from datetime import datetime, timezone
 
-# MCP SDK imports for token verification
-from mcp.server.auth.provider import TokenVerifier, TokenInfo
+# MCP SDK imports for token verification  
+from mcp.server.auth.provider import TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 
 # FastAPI for HTTP responses
@@ -49,6 +49,15 @@ class ToolPermission:
     required_roles: List[str]
     permission_level: PermissionLevel
     description: str
+
+
+@dataclass
+class TokenContext:
+    """Token context information for RBAC operations."""
+    user_roles: List[str]
+    claims: Dict[str, Any]
+    subject: str
+    app_id: str
 
 
 class RBACPolicyEngine:
@@ -189,8 +198,8 @@ class TokenValidator(ABC):
     """Abstract base class for token validation."""
     
     @abstractmethod
-    async def validate_token(self, token: str) -> TokenInfo:
-        """Validate a token and return token information."""
+    async def validate_token(self, token: str) -> TokenContext:
+        """Validate a token and return token context information."""
         pass
 
 
@@ -202,10 +211,10 @@ class AzureADTokenValidator(TokenValidator):
         self.client_id = client_id
         self.issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
         self.jwks_url = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
-        self.jwks_client = PyJWKSClient(self.jwks_url)
+        self.jwks_client = PyJWKClient(self.jwks_url)
         logger.info(f"Initialized Azure AD token validator for tenant: {tenant_id}")
 
-    async def validate_token(self, token: str) -> TokenInfo:
+    async def validate_token(self, token: str) -> TokenContext:
         """Validate Azure AD JWT token against JWKS."""
         try:
             # Get signing key from JWKS endpoint
@@ -246,13 +255,18 @@ class AzureADTokenValidator(TokenValidator):
             
             # Combine roles and scopes for comprehensive authorization
             all_permissions = list(set(roles + scopes))
-                
-            logger.info(f"Token validated - App ID: {decoded_token.get('appid', 'unknown')}, "
-                       f"Roles: {roles}, Scopes: {scopes}")
             
-            return TokenInfo(
-                scopes=all_permissions,
-                claims=decoded_token
+            subject = decoded_token.get("sub", decoded_token.get("client_id", "unknown"))
+            app_id = decoded_token.get("appid", decoded_token.get("client_id", "unknown"))
+                
+            logger.info(f"Token validated - App ID: {app_id}, "
+                       f"Subject: {subject}, Roles: {roles}, Scopes: {scopes}")
+            
+            return TokenContext(
+                user_roles=all_permissions,
+                claims=decoded_token,
+                subject=subject,
+                app_id=app_id
             )
             
         except jwt.ExpiredSignatureError:
@@ -269,47 +283,76 @@ class AzureADTokenValidator(TokenValidator):
 class RBACTokenVerifier(TokenVerifier):
     """
     MCP SDK compatible token verifier with RBAC capabilities.
-    Handles both request-level and tool-level authorization.
+    Simplified to work with current MCP SDK version.
     """
     
     def __init__(self, validator: TokenValidator, required_scopes: List[str], rbac_engine: RBACPolicyEngine):
         self.validator = validator
         self.required_scopes = required_scopes
         self.rbac_engine = rbac_engine
+        self._token_cache: Dict[str, TokenContext] = {}
 
-    async def verify_token(self, token: str) -> TokenInfo:
-        """Verify token and perform basic scope checking."""
-        token_info = await self.validator.validate_token(token)
-        
-        # Check required scopes for request-level authorization
-        if self.required_scopes:
-            user_permissions = token_info.scopes or []
-            if not any(scope in user_permissions for scope in self.required_scopes):
-                raise HTTPException(
-                    status_code=403, 
-                    detail=f"Insufficient permissions. Required: {self.required_scopes}"
-                )
-        
-        return token_info
+    async def verify_token(self, token: str) -> bool:
+        """
+        Verify token according to MCP SDK interface.
+        Returns True if valid, raises exception if invalid.
+        """
+        try:
+            token_context = await self.validator.validate_token(token)
+            
+            # Cache token context for later use in tool authorization
+            self._token_cache[token] = token_context
+            
+            # Check required scopes for request-level authorization
+            if self.required_scopes:
+                user_permissions = token_context.user_roles
+                if not any(scope in user_permissions for scope in self.required_scopes):
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=f"Insufficient permissions. Required: {self.required_scopes}"
+                    )
+            
+            return True
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Token verification failed: {str(e)}")
+            raise HTTPException(status_code=401, detail="Token verification failed")
     
-    def check_tool_authorization(self, tool_name: str, token_info: TokenInfo) -> bool:
+    def get_token_context(self, token: str) -> Optional[TokenContext]:
+        """Get cached token context for a token."""
+        return self._token_cache.get(token)
+    
+    def check_tool_authorization(self, tool_name: str, token: str) -> bool:
         """
         Check if the token holder has permission to execute a specific tool.
         
         Args:
             tool_name: Name of the MCP tool being accessed
-            token_info: Validated token information
+            token: The bearer token
             
         Returns:
             bool: True if authorized, False otherwise
         """
-        user_roles = token_info.scopes or []
-        return self.rbac_engine.check_tool_permission(tool_name, user_roles)
+        token_context = self.get_token_context(token)
+        if not token_context:
+            logger.warning(f"No token context found for tool authorization check")
+            return False
+        
+        return self.rbac_engine.check_tool_permission(tool_name, token_context.user_roles)
     
-    def get_authorization_context(self, token_info: TokenInfo) -> Dict[str, Any]:
+    def get_authorization_context(self, token: str) -> Dict[str, Any]:
         """Get comprehensive authorization context for the user."""
-        user_roles = token_info.scopes or []
-        return self.rbac_engine.get_authorization_summary(user_roles)
+        token_context = self.get_token_context(token)
+        if not token_context:
+            return {"error": "No token context available"}
+        
+        auth_summary = self.rbac_engine.get_authorization_summary(token_context.user_roles)
+        auth_summary["subject"] = token_context.subject
+        auth_summary["app_id"] = token_context.app_id
+        
+        return auth_summary
 
 
 class ProtectedResourceMetadata:

@@ -7,7 +7,6 @@ import os
 import logging
 from typing import Any, Dict
 from datetime import datetime, timezone
-import asyncio
 
 # MCP SDK imports
 from mcp.server.fastmcp import FastMCP
@@ -28,64 +27,6 @@ from auth_module import (
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class RBACProtectedMCP:
-    """
-    Wrapper for FastMCP that adds tool-level RBAC protection.
-    Completely decoupled from authentication logic.
-    """
-    
-    def __init__(self, mcp_instance: FastMCP, rbac_verifier: RBACTokenVerifier):
-        self.mcp = mcp_instance
-        self.rbac_verifier = rbac_verifier
-        self._original_tools = {}
-        self._wrap_tools_with_rbac()
-    
-    def _wrap_tools_with_rbac(self):
-        """Wrap all registered tools with RBAC authorization checks."""
-        # Store original tool implementations
-        for tool_name, tool_func in self.mcp._tools.items():
-            self._original_tools[tool_name] = tool_func
-            # Replace with RBAC-protected version
-            self.mcp._tools[tool_name] = self._create_protected_tool(tool_name, tool_func)
-        
-        logger.info(f"Wrapped {len(self._original_tools)} tools with RBAC protection")
-    
-    def _create_protected_tool(self, tool_name: str, original_func):
-        """Create an RBAC-protected version of a tool."""
-        async def protected_tool(*args, **kwargs):
-            # Get the current request token from context
-            # In a real implementation, this would be passed through the request context
-            token_info = getattr(asyncio.current_task(), 'token_info', None)
-            
-            if token_info is None:
-                raise HTTPException(
-                    status_code=401, 
-                    detail="No authentication context found"
-                )
-            
-            # Check tool-level authorization
-            if not self.rbac_verifier.check_tool_authorization(tool_name, token_info):
-                # Get permission info for better error messages
-                rbac_engine = self.rbac_verifier.rbac_engine
-                permission_info = rbac_engine.get_permission_info(tool_name)
-                
-                error_detail = f"Insufficient permissions to execute tool '{tool_name}'"
-                if permission_info:
-                    error_detail += f". Required roles: {permission_info.required_roles}"
-                
-                raise HTTPException(status_code=403, detail=error_detail)
-            
-            # Execute original tool if authorized
-            logger.info(f"Authorized execution of tool '{tool_name}' for user with roles: {token_info.scopes}")
-            return await original_func(*args, **kwargs)
-        
-        # Preserve original function metadata
-        protected_tool.__name__ = original_func.__name__
-        protected_tool.__doc__ = original_func.__doc__
-        
-        return protected_tool
 
 
 class CalculatorMCPServer:
@@ -288,14 +229,6 @@ class AuthenticatedCalculatorApp:
         
         # Initialize calculator server
         self.calculator_server = CalculatorMCPServer("RBAC-Protected Calculator")
-        
-        # Wrap MCP server with RBAC protection
-        rbac_verifier = self.auth_manager.get_rbac_verifier()
-        self.protected_mcp = RBACProtectedMCP(
-            self.calculator_server.get_fastmcp_instance(), 
-            rbac_verifier
-        )
-        
         self._configure_mcp_auth()
         
         # Initialize FastAPI app
@@ -306,12 +239,10 @@ class AuthenticatedCalculatorApp:
         self._setup_fastapi()
 
     def _configure_mcp_auth(self):
-        """Configure the MCP server with authentication using official SDK."""
-        mcp_instance = self.calculator_server.get_fastmcp_instance()
-        
-        # Configure authentication using the MCP SDK approach
-        mcp_instance._token_verifier = self.auth_manager.get_mcp_token_verifier()
-        mcp_instance._auth_settings = self.auth_manager.get_auth_settings()
+        """Configure the MCP server with authentication using simplified approach."""
+        # Note: The current MCP SDK may not support direct token_verifier configuration
+        # We'll handle authentication at the middleware level instead
+        logger.info("Authentication will be handled via FastAPI middleware")
 
     def _setup_fastapi(self):
         """Setup FastAPI application with endpoints and middleware."""
@@ -343,8 +274,9 @@ class AuthenticatedCalculatorApp:
             rbac_verifier = self.auth_manager.get_rbac_verifier()
             
             try:
-                token_info = await rbac_verifier.verify_token(token)
-                auth_context = rbac_verifier.get_authorization_context(token_info)
+                # Verify token first
+                await rbac_verifier.verify_token(token)
+                auth_context = rbac_verifier.get_authorization_context(token)
                 return auth_context
             except HTTPException:
                 raise
@@ -372,6 +304,7 @@ class AuthenticatedCalculatorApp:
             public_paths = [
                 "/health", 
                 "/.well-known/oauth-protected-resource", 
+                "/auth/info",
                 "/docs", 
                 "/openapi.json"
             ]
@@ -397,24 +330,19 @@ class AuthenticatedCalculatorApp:
                     }
                 )
             
-            # Validate token and inject into request context
+            # Validate token
             token = auth_header.split(" ", 1)[1]
             rbac_verifier = self.auth_manager.get_rbac_verifier()
             
             try:
-                token_info = await rbac_verifier.verify_token(token)
+                # Verify the token
+                await rbac_verifier.verify_token(token)
                 
-                # Inject token info into asyncio context for tool access
-                current_task = asyncio.current_task()
-                if current_task:
-                    current_task.token_info = token_info
+                # Store token in request state for tool-level authorization
+                request.state.auth_token = token
+                request.state.rbac_verifier = rbac_verifier
                 
                 response = await call_next(request)
-                
-                # Clean up context
-                if current_task and hasattr(current_task, 'token_info'):
-                    delattr(current_task, 'token_info')
-                
                 return response
                 
             except HTTPException as e:

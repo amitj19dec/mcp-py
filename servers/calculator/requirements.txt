@@ -1,5 +1,5 @@
 # Official MCP Python SDK with CLI tools
-mcp[cli]>=1.9.4
+mcp[cli]>=1.10.0
 
 # Web server dependencies for streamable HTTP transport
 uvicorn>=0.24.0
@@ -14,5 +14,5 @@ PyJWT[crypto]>=2.8.0
 cryptography>=41.0.0
 httpx>=0.25.0
 
-# JWT Key Set handling for Azure AD JWKS
-pyjwks>=1.0.0
+# JWT Key Set handling for Azure AD JWKS (note: correct package name)
+PyJWKS>=1.0.0
