@@ -3,7 +3,31 @@
     {
       "name": "calculator",
       "url": "http://localhost:8000/mcp",
-      "description": "Calculator with mathematical operations"
+      "description": "RBAC-protected calculator with mathematical operations",
+      "auth": {
+        "type": "azure_ad",
+        "tenant_id": "${AZURE_TENANT_ID}",
+        "client_id": "${AZURE_CLIENT_ID}",
+        "client_secret": "${AZURE_CLIENT_SECRET}",
+        "scope": "api://calculator-mcp-server/.default"
+      }
+    },
+    {
+      "name": "public-calculator",
+      "url": "http://localhost:8002/mcp",
+      "description": "Public calculator without authentication",
+      "auth": {
+        "type": "none"
+      }
+    },
+    {
+      "name": "test-server",
+      "url": "http://localhost:8003/mcp",
+      "description": "Test server with static bearer token",
+      "auth": {
+        "type": "bearer_token",
+        "static_token": "your-static-bearer-token-here"
+      }
     }
   ]
 }
