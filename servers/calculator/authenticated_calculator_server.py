@@ -400,6 +400,15 @@ def run_original_mode():
         original_mcp.run()
 
 
+# Global MCP server instance for CLI compatibility
+# This creates a basic MCP server that the CLI can detect and run
+_calculator_server = CalculatorMCPServer("Calculator")
+mcp = _calculator_server.get_fastmcp_instance()
+
+# For FastAPI deployment with authentication
+app = create_app()
+
+
 if __name__ == "__main__":
     # Check if authentication is enabled
     auth_enabled = os.getenv("ENABLE_AUTH", "true").lower() == "true"
