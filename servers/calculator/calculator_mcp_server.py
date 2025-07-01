@@ -1,18 +1,15 @@
 """
 Basic Calculator MCP Server (Azure Container Instance Ready) with Tool-Level Authorization
 A simple MCP server that provides basic arithmetic operations with JWT-based app role authorization.
-Supports streamable-http transport with role-based access control.
+Supports streamable-http transport with role-based access control using FastMCP Context.
 """
 
-import asyncio
 import os
 import jwt
-import json
 import logging
 from typing import Any, Dict, List, Optional
 from functools import wraps
-from contextvars import ContextVar
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import requests
@@ -21,9 +18,6 @@ import base64
 # Configure logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
-
-# Context variable to store current request info
-current_request: ContextVar[Dict[str, Any]] = ContextVar('current_request')
 
 # Role-based tool permissions
 ROLE_PERMISSIONS = {
@@ -150,14 +144,6 @@ class AuthorizationMiddleware:
 auth_middleware = AuthorizationMiddleware()
 
 
-def get_current_request_context() -> Dict[str, Any]:
-    """Get current request context including headers"""
-    try:
-        return current_request.get()
-    except LookupError:
-        return {}
-
-
 def require_app_role(required_roles: List[str]):
     """Decorator to check if user has required app roles for tool access"""
     def decorator(func):
@@ -167,9 +153,24 @@ def require_app_role(required_roles: List[str]):
                 logger.debug(f"Authentication disabled, allowing access to {func.__name__}")
                 return await func(*args, **kwargs)
             
-            # Extract request context to get authorization header
-            request_context = get_current_request_context()
-            auth_header = request_context.get('authorization')
+            # Get FastMCP context from kwargs
+            ctx = kwargs.get('ctx')
+            if not ctx:
+                logger.error(f"No FastMCP context found for {func.__name__}")
+                raise AuthorizationError("Internal error: No request context available")
+            
+            # Extract authorization header from FastMCP context
+            auth_header = None
+            try:
+                # Try to access request headers through FastMCP context
+                if hasattr(ctx, 'request') and hasattr(ctx.request, 'headers'):
+                    auth_header = ctx.request.headers.get('Authorization')
+                elif hasattr(ctx, '_request') and hasattr(ctx._request, 'headers'):
+                    auth_header = ctx._request.headers.get('Authorization')
+                else:
+                    logger.warning(f"Cannot access request headers for {func.__name__}")
+            except Exception as e:
+                logger.error(f"Error accessing request headers for {func.__name__}: {e}")
             
             if not auth_header or not auth_header.startswith('Bearer '):
                 logger.warning(f"Missing or invalid authorization header for {func.__name__}")
@@ -192,13 +193,23 @@ def require_app_role(required_roles: List[str]):
     return decorator
 
 
-def get_user_accessible_tools() -> List[str]:
+def get_user_accessible_tools(ctx: Context = None) -> List[str]:
     """Get list of tools accessible to current user"""
     if not auth_middleware.enable_auth:
         return list(ROLE_PERMISSIONS["MCP.Admin"])
     
-    request_context = get_current_request_context()
-    auth_header = request_context.get('authorization')
+    if not ctx:
+        return []
+    
+    # Extract authorization header from context
+    auth_header = None
+    try:
+        if hasattr(ctx, 'request') and hasattr(ctx.request, 'headers'):
+            auth_header = ctx.request.headers.get('Authorization')
+        elif hasattr(ctx, '_request') and hasattr(ctx._request, 'headers'):
+            auth_header = ctx._request.headers.get('Authorization')
+    except Exception:
+        pass
     
     if not auth_header or not auth_header.startswith('Bearer '):
         return []
@@ -218,7 +229,7 @@ def get_user_accessible_tools() -> List[str]:
 
 @mcp.tool()
 @require_app_role(["MCP.User", "MCP.Admin"])
-async def add(a: float, b: float) -> Dict[str, Any]:
+async def add(a: float, b: float, ctx: Context) -> Dict[str, Any]:
     """
     Add two numbers together.
     Requires: MCP.User or MCP.Admin role
@@ -241,7 +252,7 @@ async def add(a: float, b: float) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_app_role(["MCP.User", "MCP.Admin"])
-async def subtract(a: float, b: float) -> Dict[str, Any]:
+async def subtract(a: float, b: float, ctx: Context) -> Dict[str, Any]:
     """
     Subtract the second number from the first number.
     Requires: MCP.User or MCP.Admin role
@@ -264,7 +275,7 @@ async def subtract(a: float, b: float) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_app_role(["MCP.Admin"])
-async def multiply(a: float, b: float) -> Dict[str, Any]:
+async def multiply(a: float, b: float, ctx: Context) -> Dict[str, Any]:
     """
     Multiply two numbers together.
     Requires: MCP.Admin role
@@ -287,7 +298,7 @@ async def multiply(a: float, b: float) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_app_role(["MCP.Admin"])
-async def divide(a: float, b: float) -> Dict[str, Any]:
+async def divide(a: float, b: float, ctx: Context) -> Dict[str, Any]:
     """
     Divide the first number by the second number.
     Requires: MCP.Admin role
@@ -316,7 +327,7 @@ async def divide(a: float, b: float) -> Dict[str, Any]:
 
 @mcp.tool()
 @require_app_role(["MCP.Admin"])
-async def calculate_expression(expression: str) -> Dict[str, Any]:
+async def calculate_expression(expression: str, ctx: Context) -> Dict[str, Any]:
     """
     Evaluate a basic mathematical expression.
     Requires: MCP.Admin role
@@ -353,7 +364,7 @@ async def calculate_expression(expression: str) -> Dict[str, Any]:
 
 
 @mcp.resource("calculator://info")
-async def get_calculator_info() -> str:
+async def get_calculator_info(ctx: Context) -> str:
     """
     Get information about the calculator server capabilities.
     Shows only tools accessible to the current user.
@@ -361,7 +372,7 @@ async def get_calculator_info() -> str:
     Returns:
         Information about available operations based on user permissions
     """
-    accessible_tools = get_user_accessible_tools()
+    accessible_tools = get_user_accessible_tools(ctx)
     
     base_info = """
 Calculator MCP Server Information (Role-Based Access)
@@ -401,7 +412,7 @@ operands, result, and a formatted expression.
 
 
 @mcp.prompt("math_helper")
-async def math_helper_prompt() -> str:
+async def math_helper_prompt(ctx: Context) -> str:
     """
     A prompt template for helping with math problems.
     Customized based on user's accessible tools.
@@ -409,7 +420,7 @@ async def math_helper_prompt() -> str:
     Returns:
         A prompt that guides users on how to use the calculator
     """
-    accessible_tools = get_user_accessible_tools()
+    accessible_tools = get_user_accessible_tools(ctx)
     
     base_prompt = """
 I'm a calculator assistant with role-based access control.
@@ -436,23 +447,16 @@ Your available operations based on your permissions:
     return base_prompt + "\n".join(available_ops) + "\n\nWhat mathematical operation would you like me to perform?"
 
 
-
-
-# Middleware to capture request context for streamable HTTP
-def setup_request_context(request_data: Dict[str, Any]):
-    """Setup request context with authorization headers"""
-    # Extract authorization header from request
-    auth_header = None
-    if hasattr(request_data, 'headers'):
-        auth_header = request_data.headers.get('Authorization')
-    elif isinstance(request_data, dict) and 'headers' in request_data:
-        auth_header = request_data['headers'].get('Authorization')
-    
-    request_context = {
-        'authorization': auth_header,
-        'timestamp': asyncio.get_event_loop().time()
+# Custom error handler for authorization errors
+@mcp.exception_handler(AuthorizationError)
+async def handle_authorization_error(error: AuthorizationError) -> Dict[str, Any]:
+    """Handle authorization errors with user-friendly messages"""
+    return {
+        "error": "Authorization Failed",
+        "message": error.message,
+        "required_roles": error.required_roles or [],
+        "help": "Contact your administrator to request the required roles for this operation."
     }
-    current_request.set(request_context)
 
 
 if __name__ == "__main__":
@@ -478,6 +482,8 @@ if __name__ == "__main__":
         print("Endpoints available:")
         print(f"  - Health check: http://{host}:{port}/health")
         print(f"  - MCP endpoint: http://{host}:{port}/mcp")
+        print("\nNote: For full OAuth 2.1 compliance (RFC 9728), consider implementing")
+        print("the /.well-known/oauth-protected-resource endpoint in production.")
         
         # Run with streamable HTTP transport
         mcp.run(transport="streamable-http")
