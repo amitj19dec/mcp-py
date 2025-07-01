@@ -1,23 +1,227 @@
 """
-Basic Calculator MCP Server (Azure Container Instance Ready)
-A simple MCP server that provides basic arithmetic operations.
-Supports both stdio and streamable-http transports.
+Basic Calculator MCP Server (Azure Container Instance Ready) with Tool-Level Authorization
+A simple MCP server that provides basic arithmetic operations with JWT-based app role authorization.
+Supports streamable-http transport with role-based access control.
 """
 
 import asyncio
 import os
-from typing import Any, Dict
+import jwt
+import json
+import logging
+from typing import Any, Dict, List, Optional
+from functools import wraps
+from contextvars import ContextVar
 from mcp.server.fastmcp import FastMCP
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+import requests
+import base64
 
+# Configure logging
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+# Context variable to store current request info
+current_request: ContextVar[Dict[str, Any]] = ContextVar('current_request')
+
+# Role-based tool permissions
+ROLE_PERMISSIONS = {
+    "MCP.User": ["add", "subtract"],
+    "MCP.Admin": ["add", "subtract", "multiply", "divide", "calculate_expression"]
+}
 
 # Initialize FastMCP server
 mcp = FastMCP("Calculator")
 
 
+class AuthorizationError(Exception):
+    """Custom exception for authorization failures"""
+    def __init__(self, message: str, required_roles: List[str] = None):
+        self.message = message
+        self.required_roles = required_roles
+        super().__init__(message)
+
+
+class AuthorizationMiddleware:
+    """Handles JWT token validation and app role extraction"""
+    
+    def __init__(self, tenant_id: str = None, client_id: str = None):
+        self.tenant_id = tenant_id or os.getenv("AZURE_TENANT_ID")
+        self.client_id = client_id or os.getenv("AZURE_CLIENT_ID")
+        self.enable_auth = os.getenv("ENABLE_AUTH", "false").lower() == "true"
+        self._jwks_cache = {}
+        
+        if self.enable_auth and (not self.tenant_id or not self.client_id):
+            logger.warning("Authentication enabled but missing Azure AD configuration")
+    
+    def extract_app_roles(self, token: str) -> List[str]:
+        """Extract app roles from JWT token"""
+        if not self.enable_auth:
+            # If auth is disabled, return admin role for demo purposes
+            return ["MCP.Admin"]
+        
+        try:
+            # Decode without verification first to get header
+            header = jwt.get_unverified_header(token)
+            
+            # Get signing key
+            key = self._get_signing_key(header.get('kid'))
+            
+            # Decode and verify token
+            payload = jwt.decode(
+                token,
+                key,
+                algorithms=['RS256'],
+                audience=self.client_id,
+                issuer=f"https://login.microsoftonline.com/{self.tenant_id}/v2.0"
+            )
+            
+            # Extract app roles from token
+            roles = payload.get('roles', [])
+            logger.info(f"Successfully extracted roles from token: {roles}")
+            return roles
+            
+        except jwt.InvalidTokenError as e:
+            logger.warning(f"Token validation failed: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Error extracting app roles: {e}")
+            return []
+    
+    def _get_signing_key(self, kid: str):
+        """Get JWT signing key from Azure AD JWKS endpoint"""
+        if not self.tenant_id:
+            raise ValueError("Tenant ID not configured")
+        
+        # Cache JWKS for performance
+        if kid in self._jwks_cache:
+            return self._jwks_cache[kid]
+        
+        try:
+            jwks_url = f"https://login.microsoftonline.com/{self.tenant_id}/discovery/v2.0/keys"
+            response = requests.get(jwks_url, timeout=10)
+            response.raise_for_status()
+            
+            jwks = response.json()
+            
+            # Find the key with matching kid
+            for key in jwks.get('keys', []):
+                if key.get('kid') == kid:
+                    # Convert JWK to PEM format
+                    public_key = self._jwk_to_pem(key)
+                    self._jwks_cache[kid] = public_key
+                    return public_key
+            
+            raise ValueError(f"Key with kid '{kid}' not found in JWKS")
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve signing key: {e}")
+            raise
+    
+    def _jwk_to_pem(self, jwk: Dict) -> str:
+        """Convert JWK to PEM format"""
+        try:
+            # Extract n and e from JWK
+            n = base64.urlsafe_b64decode(jwk['n'] + '==')
+            e = base64.urlsafe_b64decode(jwk['e'] + '==')
+            
+            # Convert to integers
+            n_int = int.from_bytes(n, 'big')
+            e_int = int.from_bytes(e, 'big')
+            
+            # Create RSA public key
+            public_key = rsa.RSAPublicNumbers(e_int, n_int).public_key()
+            
+            # Convert to PEM
+            pem = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            
+            return pem
+            
+        except Exception as e:
+            logger.error(f"Failed to convert JWK to PEM: {e}")
+            raise
+
+
+# Initialize authorization middleware
+auth_middleware = AuthorizationMiddleware()
+
+
+def get_current_request_context() -> Dict[str, Any]:
+    """Get current request context including headers"""
+    try:
+        return current_request.get()
+    except LookupError:
+        return {}
+
+
+def require_app_role(required_roles: List[str]):
+    """Decorator to check if user has required app roles for tool access"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            if not auth_middleware.enable_auth:
+                logger.debug(f"Authentication disabled, allowing access to {func.__name__}")
+                return await func(*args, **kwargs)
+            
+            # Extract request context to get authorization header
+            request_context = get_current_request_context()
+            auth_header = request_context.get('authorization')
+            
+            if not auth_header or not auth_header.startswith('Bearer '):
+                logger.warning(f"Missing or invalid authorization header for {func.__name__}")
+                raise AuthorizationError("Missing or invalid authorization header")
+            
+            token = auth_header[7:]  # Remove 'Bearer ' prefix
+            user_roles = auth_middleware.extract_app_roles(token)
+            
+            # Check if user has any of the required roles
+            if not any(role in user_roles for role in required_roles):
+                logger.warning(f"Access denied to {func.__name__}. User roles: {user_roles}, Required: {required_roles}")
+                raise AuthorizationError(
+                    f"Insufficient permissions. Required roles: {required_roles}",
+                    required_roles
+                )
+            
+            logger.info(f"Access granted to {func.__name__}. User roles: {user_roles}")
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def get_user_accessible_tools() -> List[str]:
+    """Get list of tools accessible to current user"""
+    if not auth_middleware.enable_auth:
+        return list(ROLE_PERMISSIONS["MCP.Admin"])
+    
+    request_context = get_current_request_context()
+    auth_header = request_context.get('authorization')
+    
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return []
+    
+    token = auth_header[7:]
+    user_roles = auth_middleware.extract_app_roles(token)
+    
+    accessible_tools = set()
+    for role in user_roles:
+        if role in ROLE_PERMISSIONS:
+            accessible_tools.update(ROLE_PERMISSIONS[role])
+    
+    return list(accessible_tools)
+
+
+# Tool implementations with role-based authorization
+
 @mcp.tool()
+@require_app_role(["MCP.User", "MCP.Admin"])
 async def add(a: float, b: float) -> Dict[str, Any]:
     """
     Add two numbers together.
+    Requires: MCP.User or MCP.Admin role
     
     Args:
         a: First number
@@ -36,9 +240,11 @@ async def add(a: float, b: float) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@require_app_role(["MCP.User", "MCP.Admin"])
 async def subtract(a: float, b: float) -> Dict[str, Any]:
     """
     Subtract the second number from the first number.
+    Requires: MCP.User or MCP.Admin role
     
     Args:
         a: First number (minuend)
@@ -57,9 +263,11 @@ async def subtract(a: float, b: float) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@require_app_role(["MCP.Admin"])
 async def multiply(a: float, b: float) -> Dict[str, Any]:
     """
     Multiply two numbers together.
+    Requires: MCP.Admin role
     
     Args:
         a: First number
@@ -78,9 +286,11 @@ async def multiply(a: float, b: float) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@require_app_role(["MCP.Admin"])
 async def divide(a: float, b: float) -> Dict[str, Any]:
     """
     Divide the first number by the second number.
+    Requires: MCP.Admin role
     
     Args:
         a: Dividend (number to be divided)
@@ -105,9 +315,11 @@ async def divide(a: float, b: float) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@require_app_role(["MCP.Admin"])
 async def calculate_expression(expression: str) -> Dict[str, Any]:
     """
     Evaluate a basic mathematical expression.
+    Requires: MCP.Admin role
     
     Args:
         expression: Mathematical expression as a string (e.g., "2 + 3 * 4")
@@ -144,74 +356,141 @@ async def calculate_expression(expression: str) -> Dict[str, Any]:
 async def get_calculator_info() -> str:
     """
     Get information about the calculator server capabilities.
+    Shows only tools accessible to the current user.
     
     Returns:
-        Information about available operations
+        Information about available operations based on user permissions
     """
-    info = """
-    Calculator MCP Server Information
-    ================================
+    accessible_tools = get_user_accessible_tools()
     
-    Available Operations:
-    - add(a, b): Add two numbers
-    - subtract(a, b): Subtract b from a
-    - multiply(a, b): Multiply two numbers
-    - divide(a, b): Divide a by b (b cannot be zero)
-    - calculate_expression(expression): Evaluate a mathematical expression
+    base_info = """
+Calculator MCP Server Information (Role-Based Access)
+===================================================
+
+Authentication: {}
+Your accessible operations:
+""".format("Enabled" if auth_middleware.enable_auth else "Disabled (Demo Mode)")
     
-    All operations return detailed results including the operation type,
-    operands, result, and a formatted expression.
+    tool_descriptions = {
+        "add": "- add(a, b): Add two numbers",
+        "subtract": "- subtract(a, b): Subtract b from a", 
+        "multiply": "- multiply(a, b): Multiply two numbers",
+        "divide": "- divide(a, b): Divide a by b (b cannot be zero)",
+        "calculate_expression": "- calculate_expression(expression): Evaluate a mathematical expression"
+    }
     
-    Example usage:
-    - add(5, 3) returns 8
-    - subtract(10, 4) returns 6
-    - multiply(7, 6) returns 42
-    - divide(15, 3) returns 5
-    - calculate_expression("2 + 3 * 4") returns 14
-    """
-    return info
+    available_ops = []
+    for tool in accessible_tools:
+        if tool in tool_descriptions:
+            available_ops.append(tool_descriptions[tool])
+    
+    if not available_ops:
+        available_ops.append("- No operations available (insufficient permissions)")
+    
+    role_info = """
+
+Role-Based Access Control:
+- MCP.User: Basic operations (add, subtract)
+- MCP.Admin: All operations (add, subtract, multiply, divide, calculate_expression)
+
+All operations return detailed results including the operation type,
+operands, result, and a formatted expression.
+"""
+    
+    return base_info + "\n".join(available_ops) + role_info
 
 
 @mcp.prompt("math_helper")
 async def math_helper_prompt() -> str:
     """
     A prompt template for helping with math problems.
+    Customized based on user's accessible tools.
     
     Returns:
         A prompt that guides users on how to use the calculator
     """
-    return """
-    I'm a calculator assistant that can help you with basic arithmetic operations.
+    accessible_tools = get_user_accessible_tools()
     
-    I can perform the following operations:
-    1. Addition: add(a, b)
-    2. Subtraction: subtract(a, b)
-    3. Multiplication: multiply(a, b)
-    4. Division: divide(a, b)
-    5. Expression evaluation: calculate_expression("expression")
+    base_prompt = """
+I'm a calculator assistant with role-based access control.
+
+Your available operations based on your permissions:
+"""
     
-    What mathematical operation would you like me to perform?
-    Please provide the numbers or expression you'd like me to calculate.
-    """
+    tool_descriptions = {
+        "add": "1. Addition: add(a, b)",
+        "subtract": "2. Subtraction: subtract(a, b)",
+        "multiply": "3. Multiplication: multiply(a, b)", 
+        "divide": "4. Division: divide(a, b)",
+        "calculate_expression": "5. Expression evaluation: calculate_expression(\"expression\")"
+    }
+    
+    available_ops = []
+    for tool in accessible_tools:
+        if tool in tool_descriptions:
+            available_ops.append(tool_descriptions[tool])
+    
+    if not available_ops:
+        return base_prompt + "\nNo operations available. Please contact your administrator for access."
+    
+    return base_prompt + "\n".join(available_ops) + "\n\nWhat mathematical operation would you like me to perform?"
+
+
+# Custom error handler for authorization errors
+@mcp.exception_handler(AuthorizationError)
+async def handle_authorization_error(error: AuthorizationError) -> Dict[str, Any]:
+    """Handle authorization errors with user-friendly messages"""
+    return {
+        "error": "Authorization Failed",
+        "message": error.message,
+        "required_roles": error.required_roles or [],
+        "help": "Contact your administrator to request the required roles for this operation."
+    }
+
+
+# Middleware to capture request context for streamable HTTP
+def setup_request_context(request_data: Dict[str, Any]):
+    """Setup request context with authorization headers"""
+    # Extract authorization header from request
+    auth_header = None
+    if hasattr(request_data, 'headers'):
+        auth_header = request_data.headers.get('Authorization')
+    elif isinstance(request_data, dict) and 'headers' in request_data:
+        auth_header = request_data['headers'].get('Authorization')
+    
+    request_context = {
+        'authorization': auth_header,
+        'timestamp': asyncio.get_event_loop().time()
+    }
+    current_request.set(request_context)
 
 
 if __name__ == "__main__":
     # Get configuration from environment variables
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
     
-    print(f"Starting Calculator MCP Server...")
+    print(f"Starting Calculator MCP Server with Authentication...")
     print(f"Transport: {transport}")
+    print(f"Authentication: {'Enabled' if auth_middleware.enable_auth else 'Disabled (Demo Mode)'}")
+    
+    if auth_middleware.enable_auth:
+        print(f"Azure Tenant ID: {auth_middleware.tenant_id}")
+        print(f"Azure Client ID: {auth_middleware.client_id}")
+        print("Role Permissions:")
+        for role, tools in ROLE_PERMISSIONS.items():
+            print(f"  {role}: {', '.join(tools)}")
     
     if transport == "streamable-http":
-        print("Server will listen on default host and port (0.0.0.0:8000)")
-        print("Endpoints available:")
-        print("  - Health check: http://0.0.0.0:8000/health")
-        print("  - MCP endpoint: http://0.0.0.0:8000/mcp")
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_PORT", "8000"))
         
-        # The official MCP SDK FastMCP.run() only accepts transport parameter
-        # Host and port are configured through other means or use defaults
-        mcp.run(transport="streamable-http" )
+        print(f"Server will listen on {host}:{port}")
+        print("Endpoints available:")
+        print(f"  - Health check: http://{host}:{port}/health")
+        print(f"  - MCP endpoint: http://{host}:{port}/mcp")
+        
+        # Run with streamable HTTP transport
+        mcp.run(transport="streamable-http")
     else:
-        print("Running with stdio transport for local development")
-        # Run with stdio transport for local development
-        mcp.run()
+        print("Only streamable-http transport is supported in this version")
+        exit(1)
