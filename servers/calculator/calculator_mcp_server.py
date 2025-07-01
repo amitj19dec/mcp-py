@@ -436,16 +436,6 @@ Your available operations based on your permissions:
     return base_prompt + "\n".join(available_ops) + "\n\nWhat mathematical operation would you like me to perform?"
 
 
-# Custom error handler for authorization errors
-@mcp.exception_handler(AuthorizationError)
-async def handle_authorization_error(error: AuthorizationError) -> Dict[str, Any]:
-    """Handle authorization errors with user-friendly messages"""
-    return {
-        "error": "Authorization Failed",
-        "message": error.message,
-        "required_roles": error.required_roles or [],
-        "help": "Contact your administrator to request the required roles for this operation."
-    }
 
 
 # Middleware to capture request context for streamable HTTP
