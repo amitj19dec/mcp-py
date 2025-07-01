@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 # FastMCP 2.0 imports
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 # Authentication
 from auth_manager import TokenManager
@@ -84,55 +85,38 @@ server_auth_config: Dict[str, Dict] = {}
 # Configuration file path
 CONFIG_FILE_PATH = "/Users/amitj/Documents/code2.0/mcp-py/client/mcp_config.json"
 
-# Authentication-aware MCP client wrapper
-class AuthenticatedMCPClient:
-    def __init__(self, base_client, server_name: str):
-        self.base_client = base_client
-        self.server_name = server_name
-    
-    async def __aenter__(self):
-        self.session = await self.base_client.__aenter__()
-        return self
-    
-    async def __aexit__(self, *args):
-        return await self.base_client.__aexit__(*args)
-    
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]):
-        # Check if auth is required for this server
-        auth_required = False
-        token = None
+async def create_authenticated_client(server_name: str, server_url: str) -> Client:
+    """Create an MCP client with authentication if required."""
+    # Check if auth is required for this server
+    if server_name in server_auth_config:
+        auth_config = server_auth_config[server_name]
+        auth_required = auth_config.get('enabled', False)
         
-        if self.server_name in server_auth_config:
-            auth_config = server_auth_config[self.server_name]
-            auth_required = auth_config.get('enabled', False)
+        if auth_required:
+            scope = auth_config.get('scope')
+            if not scope:
+                logger.error(f"❌ Auth enabled but no scope configured for {server_name}")
+                raise Exception(f"Authentication enabled but scope not configured for {server_name}")
             
-            if auth_required:
-                scope = auth_config.get('scope')
-                if not scope:
-                    logger.error(f"❌ Auth enabled but no scope configured for {self.server_name}")
-                    raise Exception(f"Authentication enabled but scope not configured for {self.server_name}")
-                
-                token = await token_manager.get_token(scope)
-                if token:
-                    logger.info(f"🔐 Using token for {self.server_name}.{tool_name}")
-                else:
-                    logger.error(f"❌ Failed to acquire token for {self.server_name}.{tool_name}")
-                    raise Exception(f"Authentication required but token acquisition failed for {self.server_name}")
+            token = await token_manager.get_token(scope)
+            if token:
+                logger.info(f"🔐 Creating authenticated client for {server_name}")
+                # Create transport with authentication headers
+                transport = StreamableHttpTransport(
+                    url=server_url,
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                return Client(transport)
             else:
-                logger.debug(f"🔓 Auth disabled for {self.server_name}.{tool_name}")
+                logger.error(f"❌ Failed to acquire token for {server_name}")
+                raise Exception(f"Authentication required but token acquisition failed for {server_name}")
         else:
-            logger.debug(f"🔓 No auth config for {self.server_name}.{tool_name}")
-        
-        # Make the call with token if available
-        if token:
-            # Add authorization header to the session
-            if hasattr(self.session, '_client') and hasattr(self.session._client, 'headers'):
-                self.session._client.headers['Authorization'] = f'Bearer {token}'
-        
-        return await self.session.call_tool(tool_name, arguments)
+            logger.debug(f"🔓 Auth disabled for {server_name}")
+    else:
+        logger.debug(f"🔓 No auth config for {server_name}")
     
-    def __getattr__(self, name):
-        return getattr(self.session, name)
+    # Return client without authentication
+    return Client(server_url)
 
 def initialize_chat_handler():
     """Initialize Azure OpenAI chat handler."""
@@ -474,15 +458,25 @@ async def get_all_prompts():
 @app.post("/tools/call", response_model=ToolResult)
 async def call_tool(request: ToolCallRequest):
     """Execute a tool on the specified server."""
-    if request.server_name not in mcp_clients:
-        raise HTTPException(404, f"Server {request.server_name} not connected")
+    if request.server_name not in server_details:
+        raise HTTPException(404, f"Server {request.server_name} not found")
     
     try:
-        client = mcp_clients[request.server_name]
-        auth_client = AuthenticatedMCPClient(client, request.server_name)
+        # Get server URL from stored details
+        server_config = None
+        for config in load_mcp_config():
+            if config.name == request.server_name:
+                server_config = config
+                break
+        
+        if not server_config:
+            raise HTTPException(404, f"Server config for {request.server_name} not found")
+        
+        # Create authenticated client for this specific call
+        client = await create_authenticated_client(request.server_name, server_config.url)
         
         # Use authenticated client for tool calls
-        async with auth_client as session:
+        async with client as session:
             result = await session.call_tool(request.tool_name, request.arguments)
             
             logger.info(f"✅ Tool call: {request.server_name}.{request.tool_name}")

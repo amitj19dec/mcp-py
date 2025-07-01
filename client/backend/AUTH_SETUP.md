@@ -97,7 +97,7 @@ Look for:
 ## Changes Made
 
 - ✅ `auth_manager.py` - New token management module
-- ✅ `main.py` - Added authentication support and AuthenticatedMCPClient wrapper
+- ✅ `main.py` - Replaced AuthenticatedMCPClient wrapper with `create_authenticated_client()` function using proper FastMCP 2.0 transport configuration
 - ✅ `chat_handler.py` - Updated to use authenticated client
 - ✅ `mcp_config.json` - Added auth configuration for calculator server
 - ✅ `.env.example` - Added authentication environment variables
@@ -106,9 +106,18 @@ Look for:
 ## Architecture
 
 ```
-Client Request → AuthenticatedMCPClient → Token Manager → Azure AD
-                                        ↓
-                Tool Call + Bearer Token → MCP Server → Role Validation
+Client Request → create_authenticated_client() → Token Manager → Azure AD
+                                               ↓
+            StreamableHttpTransport with Bearer Token → MCP Server → Role Validation
 ```
+
+The implementation uses FastMCP 2.0's correct approach of configuring authentication at the transport level, not by modifying session internals.
+
+## How Authentication Works
+
+1. **Client Creation**: For each tool call, a new authenticated client is created using `create_authenticated_client()`
+2. **Transport Configuration**: If auth is enabled, a `StreamableHttpTransport` is created with `Authorization: Bearer <token>` header
+3. **Token Management**: Tokens are acquired via Azure AD client credentials flow and cached automatically
+4. **Header Injection**: Headers are set at transport creation time, following FastMCP 2.0 best practices
 
 The minimal integration preserves all existing functionality while adding authentication as an optional layer.

@@ -154,11 +154,19 @@ Remember: The tool names in function calls should be prefixed with the server na
                         
                         # Execute tool via MCP client
                         if server_name in mcp_clients:
-                            from main import AuthenticatedMCPClient
-                            client = mcp_clients[server_name]
-                            auth_client = AuthenticatedMCPClient(client, server_name)
-                            async with auth_client as session:
-                                result = await session.call_tool(tool_name, arguments)
+                            from main import create_authenticated_client, load_mcp_config
+                            
+                            # Get server URL
+                            server_url = None
+                            for config in load_mcp_config():
+                                if config.name == server_name:
+                                    server_url = config.url
+                                    break
+                            
+                            if server_url:
+                                client = await create_authenticated_client(server_name, server_url)
+                                async with client as session:
+                                    result = await session.call_tool(tool_name, arguments)
                                 
                                 tool_calls_made.append({
                                     "server": server_name,
@@ -175,6 +183,13 @@ Remember: The tool names in function calls should be prefixed with the server na
                                 })
                                 
                                 logger.info(f"✅ Tool executed: {server_name}.{tool_name}")
+                            else:
+                                logger.error(f"❌ Server URL not found for: {server_name}")
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": f"Error: Server URL not found for {server_name}"
+                                })
                         else:
                             logger.error(f"❌ Server not found: {server_name}")
                             messages.append({
