@@ -1,0 +1,26 @@
+{
+  "servers": [
+    {
+      "name": "calculator",
+      "url": "http://localhost:8000/mcp",
+      "description": "Calculator with mathematical operations",
+      "auth": {
+        "enabled": true,
+        "scope": "api://your-server-app-id/.default"
+      }
+    },
+    {
+      "name": "unauthenticated-server",
+      "url": "http://localhost:8001/mcp",
+      "description": "Example server without authentication",
+      "auth": {
+        "enabled": false
+      }
+    },
+    {
+      "name": "no-auth-config",
+      "url": "http://localhost:8002/mcp",
+      "description": "Server with no auth configuration"
+    }
+  ]
+}

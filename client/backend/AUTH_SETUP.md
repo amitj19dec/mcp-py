@@ -48,16 +48,51 @@ Look for:
 
 ## How It Works
 
-1. **Token Acquisition**: Client automatically gets Azure AD tokens using client credentials flow
-2. **Token Caching**: Tokens are cached and refreshed automatically before expiration
-3. **Automatic Injection**: Bearer tokens are added to tool calls for authenticated servers
-4. **Fallback**: Servers without auth config work normally without tokens
+1. **Auth Decision Logic**:
+   - `"enabled": true` → Client MUST acquire token, fails if token acquisition fails
+   - `"enabled": false` → Client skips authentication for this server
+   - No auth config → Client skips authentication for this server
+
+2. **Token Acquisition**: Client automatically gets Azure AD tokens using client credentials flow
+3. **Token Caching**: Tokens are cached and refreshed automatically before expiration
+4. **Automatic Injection**: Bearer tokens are added to tool calls for authenticated servers
+5. **Error Handling**: Tool calls fail fast if auth is required but token cannot be acquired
 
 ## Testing
 
-1. **With Auth Disabled**: Set `"enabled": false` in server auth config - tools work without tokens
-2. **With Auth Enabled**: Set `"enabled": true` - client will acquire and send bearer tokens
-3. **Invalid Credentials**: Tools will fail with 401/403 errors if token acquisition fails
+1. **Auth Disabled**: Set `"enabled": false` - tools work without tokens
+2. **Auth Enabled with Valid Creds**: Set `"enabled": true` with valid Azure AD config - tools work with tokens
+3. **Auth Enabled with Invalid Creds**: Set `"enabled": true` with missing/invalid Azure AD config - tools fail immediately
+4. **No Auth Config**: Omit auth section entirely - tools work without tokens
+
+## Configuration Examples
+
+```json
+{
+  "servers": [
+    {
+      "name": "secure-server",
+      "url": "http://localhost:8000/mcp",
+      "auth": {
+        "enabled": true,
+        "scope": "api://server-app-id/.default"
+      }
+    },
+    {
+      "name": "public-server", 
+      "url": "http://localhost:8001/mcp",
+      "auth": {
+        "enabled": false
+      }
+    },
+    {
+      "name": "legacy-server",
+      "url": "http://localhost:8002/mcp"
+      // No auth config = no authentication
+    }
+  ]
+}
+```
 
 ## Changes Made
 

@@ -98,15 +98,30 @@ class AuthenticatedMCPClient:
         return await self.base_client.__aexit__(*args)
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]):
-        # Get token if auth is enabled for this server
+        # Check if auth is required for this server
+        auth_required = False
         token = None
+        
         if self.server_name in server_auth_config:
             auth_config = server_auth_config[self.server_name]
-            if auth_config.get('enabled'):
+            auth_required = auth_config.get('enabled', False)
+            
+            if auth_required:
                 scope = auth_config.get('scope')
-                if scope:
-                    token = await token_manager.get_token(scope)
+                if not scope:
+                    logger.error(f"❌ Auth enabled but no scope configured for {self.server_name}")
+                    raise Exception(f"Authentication enabled but scope not configured for {self.server_name}")
+                
+                token = await token_manager.get_token(scope)
+                if token:
                     logger.info(f"🔐 Using token for {self.server_name}.{tool_name}")
+                else:
+                    logger.error(f"❌ Failed to acquire token for {self.server_name}.{tool_name}")
+                    raise Exception(f"Authentication required but token acquisition failed for {self.server_name}")
+            else:
+                logger.debug(f"🔓 Auth disabled for {self.server_name}.{tool_name}")
+        else:
+            logger.debug(f"🔓 No auth config for {self.server_name}.{tool_name}")
         
         # Make the call with token if available
         if token:
