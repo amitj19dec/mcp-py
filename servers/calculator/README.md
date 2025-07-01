@@ -103,4 +103,24 @@ add(5, 3)
 
 calculate_expression("2 + 3 * 4")  
 # Returns: {"operation": "expression_evaluation", "expression": "2 + 3 * 4", "result": 14}
+
+# Use the access_token from step 1
+TOKEN="eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsIng1dCI6..."
+
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "add",
+      "arguments": {
+        "a": 5,
+        "b": 3
+      }
+    }
+  }'
 ```
