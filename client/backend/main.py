@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 # FastMCP 2.0 imports
 from fastmcp import Client
 
+# Authentication
+from auth_manager import TokenManager
+
 # Chat functionality
 from chat_handler import ChatHandler, ChatMessage, ChatResponse
 
@@ -33,6 +36,7 @@ class MCPServerConfig(BaseModel):
     name: str
     url: str
     description: str = ""
+    auth: Optional[Dict[str, Any]] = None
 
 class ToolInfo(BaseModel):
     name: str
@@ -74,9 +78,46 @@ class ToolResult(BaseModel):
 server_details: Dict[str, ServerDetails] = {}
 mcp_clients: Dict[str, Client] = {}
 chat_handler: Optional[ChatHandler] = None
+token_manager = TokenManager()
+server_auth_config: Dict[str, Dict] = {}
 
 # Configuration file path
 CONFIG_FILE_PATH = "/Users/amitj/Documents/code2.0/mcp-py/client/mcp_config.json"
+
+# Authentication-aware MCP client wrapper
+class AuthenticatedMCPClient:
+    def __init__(self, base_client, server_name: str):
+        self.base_client = base_client
+        self.server_name = server_name
+    
+    async def __aenter__(self):
+        self.session = await self.base_client.__aenter__()
+        return self
+    
+    async def __aexit__(self, *args):
+        return await self.base_client.__aexit__(*args)
+    
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]):
+        # Get token if auth is enabled for this server
+        token = None
+        if self.server_name in server_auth_config:
+            auth_config = server_auth_config[self.server_name]
+            if auth_config.get('enabled'):
+                scope = auth_config.get('scope')
+                if scope:
+                    token = await token_manager.get_token(scope)
+                    logger.info(f"🔐 Using token for {self.server_name}.{tool_name}")
+        
+        # Make the call with token if available
+        if token:
+            # Add authorization header to the session
+            if hasattr(self.session, '_client') and hasattr(self.session._client, 'headers'):
+                self.session._client.headers['Authorization'] = f'Bearer {token}'
+        
+        return await self.session.call_tool(tool_name, arguments)
+    
+    def __getattr__(self, name):
+        return getattr(self.session, name)
 
 def initialize_chat_handler():
     """Initialize Azure OpenAI chat handler."""
@@ -117,11 +158,17 @@ def load_mcp_config() -> List[MCPServerConfig]:
         
         servers = []
         for server_config in config_data.get('servers', []):
-            servers.append(MCPServerConfig(
+            config = MCPServerConfig(
                 name=server_config['name'],
                 url=server_config['url'],
-                description=server_config.get('description', '')
-            ))
+                description=server_config.get('description', ''),
+                auth=server_config.get('auth')
+            )
+            servers.append(config)
+            
+            # Store auth config globally
+            if config.auth:
+                server_auth_config[config.name] = config.auth
         
         logger.info(f"📄 Loaded {len(servers)} server configs from {CONFIG_FILE_PATH}")
         return servers
@@ -134,6 +181,10 @@ async def load_server_details(config: MCPServerConfig) -> ServerDetails:
     """Load complete server details - tools, resources, prompts."""
     try:
         logger.info(f"Loading details for {config.name}...")
+        
+        # Store auth config
+        if config.auth:
+            server_auth_config[config.name] = config.auth
         
         # Connect to MCP server using FastMCP 2.0 pattern
         client = Client(config.url)
@@ -413,9 +464,10 @@ async def call_tool(request: ToolCallRequest):
     
     try:
         client = mcp_clients[request.server_name]
+        auth_client = AuthenticatedMCPClient(client, request.server_name)
         
-        # Use FastMCP 2.0 context manager for tool calls
-        async with client as session:
+        # Use authenticated client for tool calls
+        async with auth_client as session:
             result = await session.call_tool(request.tool_name, request.arguments)
             
             logger.info(f"✅ Tool call: {request.server_name}.{request.tool_name}")
@@ -476,12 +528,18 @@ async def health_check():
     """Health check endpoint."""
     healthy_servers = [name for name, details in server_details.items() if details.status == "connected"]
     
+    # Check auth status
+    auth_configured = bool(os.getenv("MCP_CLIENT_ID") and os.getenv("MCP_CLIENT_SECRET") and os.getenv("MCP_TENANT_ID"))
+    auth_enabled_servers = [name for name, config in server_auth_config.items() if config.get('enabled')]
+    
     return {
         "status": "healthy",
         "servers_loaded": len(server_details),
         "healthy_servers": len(healthy_servers),
         "server_status": {name: details.status for name, details in server_details.items()},
-        "chat_available": chat_handler is not None
+        "chat_available": chat_handler is not None,
+        "auth_configured": auth_configured,
+        "auth_enabled_servers": auth_enabled_servers
     }
 
 if __name__ == "__main__":

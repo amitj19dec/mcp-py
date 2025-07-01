@@ -3,7 +3,11 @@
     {
       "name": "calculator",
       "url": "http://localhost:8000/mcp",
-      "description": "Calculator with mathematical operations"
+      "description": "Calculator with mathematical operations",
+      "auth": {
+        "enabled": true,
+        "scope": "api://your-server-app-id/.default"
+      }
     }
   ]
 }

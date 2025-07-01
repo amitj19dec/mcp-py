@@ -154,8 +154,10 @@ Remember: The tool names in function calls should be prefixed with the server na
                         
                         # Execute tool via MCP client
                         if server_name in mcp_clients:
+                            from main import AuthenticatedMCPClient
                             client = mcp_clients[server_name]
-                            async with client as session:
+                            auth_client = AuthenticatedMCPClient(client, server_name)
+                            async with auth_client as session:
                                 result = await session.call_tool(tool_name, arguments)
                                 
                                 tool_calls_made.append({
