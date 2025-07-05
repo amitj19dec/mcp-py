@@ -8,7 +8,7 @@ import logging
 from typing import Any, Dict, List
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.auth.settings import AuthSettings
-from azure_token_verifier_refactored import AzureTokenVerifier
+from azure_token_verifier import AzureTokenVerifier
 
 # Configure logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
