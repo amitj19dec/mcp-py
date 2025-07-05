@@ -1,10 +1,15 @@
-# Official MCP Python SDK with CLI tools
-mcp[cli]>=1.0.0
+# Requirements for Calculator MCP Server with Official SDK Auth
+# Core MCP SDK
+mcp>=1.2.0
 
-# Web server dependencies for streamable HTTP transport
-uvicorn>=0.24.0
-fastapi>=0.104.0
+# Azure AD JWT token validation
+PyJWT>=2.8.0
+cryptography>=41.0.0
+requests>=2.31.0
 
-# Additional utilities
-pydantic>=2.0.0
-anyio>=4.0.0
+# Optional: For enhanced logging and debugging
+python-dotenv>=1.0.0
+
+# Development dependencies (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
