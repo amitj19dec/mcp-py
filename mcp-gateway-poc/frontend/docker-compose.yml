@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  frontend-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+      - REACT_APP_API_URL=http://localhost:8001
+      - REACT_APP_UI_TOKEN=ui-dev-token-456
+      - REACT_APP_ENABLE_DEBUG=true
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  frontend-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - REACT_APP_API_URL=http://localhost:8001
+        - REACT_APP_UI_TOKEN=ui-dev-token-456
+        - REACT_APP_ENABLE_DEBUG=false
+    ports:
+      - "3001:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: mcp-gateway-frontend
