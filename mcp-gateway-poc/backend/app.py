@@ -40,7 +40,6 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting MCP Gateway - Streamable HTTP Protocol Only")
     logger.info(f"Protocol: {config.protocol}, Transport: {config.transport}")
-    logger.info("Note: SSE transport deprecated as of June 2025")
     await server_manager.initialize()
     logger.info("MCP Gateway started successfully with Streamable HTTP")
     
@@ -177,8 +176,7 @@ async def handle_initialize(request_id: Any, params: Dict[str, Any], client_id: 
             "name": "mcp-gateway-streamable-http",
             "version": "1.0.0",
             "protocol": "streamable-http",
-            "transport": "http",
-            "note": "SSE deprecated as of June 2025"
+            "transport": "http"
         }
     }
     

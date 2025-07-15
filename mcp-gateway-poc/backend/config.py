@@ -85,9 +85,7 @@ class Config:
         # All endpoints MUST be HTTP/HTTPS URLs
         # Examples:
         # - "api:http://localhost:8000:api"  (connects to http://localhost:8000/mcp)
-        # - "crm:https://crm-server.company.com:crm"
-        # - "demo:http://demo-server:8081:demo"
-        
+
         servers_env = os.getenv("MCP_SERVERS", "")
         if servers_env:
             for server_str in servers_env.split(","):
@@ -110,42 +108,12 @@ class Config:
         
         # If no servers configured, use default for development
         if not servers:
-            servers = self._get_default_servers()
+            print("No MCP servers found from the config")
         
         return servers
-    
-    def _get_default_servers(self) -> List[ServerConfig]:
-        """Get default development servers with Streamable HTTP examples"""
-        default_servers = []
-        
-        # Demo server example (local HTTP endpoint)
-        demo_endpoint = os.getenv("DEMO_SERVER_ENDPOINT", "http://localhost:8000")
-        if demo_endpoint.startswith(('http://', 'https://')):
-            default_servers.append(ServerConfig(
-                name="demo-http",
-                endpoint=demo_endpoint,
-                namespace="demo"
-            ))
-        
-        # API server example (remote HTTPS endpoint)
-        api_endpoint = os.getenv("API_SERVER_ENDPOINT", "")
-        if api_endpoint and api_endpoint.startswith(('http://', 'https://')):
-            default_servers.append(ServerConfig(
-                name="remote-api",
-                endpoint=api_endpoint,
-                namespace="api"
-            ))
-        
-        # If no valid defaults, provide a template
-        if not default_servers:
-            print("Warning: No valid HTTP servers configured. Please set MCP_SERVERS environment variable.")
-            print("Example: MCP_SERVERS='demo:http://localhost:8080:demo,api:https://api-server.com:api'")
-        
-        return default_servers
-    
+
     def add_server(self, server: ServerConfig):
         """Add a new backend server configuration"""
-        # Validate it's HTTP/HTTPS
         if not server.endpoint.startswith(('http://', 'https://')):
             raise ValueError(f"Only HTTP/HTTPS endpoints are supported. Got: {server.endpoint}")
         

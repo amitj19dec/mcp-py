@@ -9,7 +9,7 @@ from datetime import datetime
 from contextlib import AsyncExitStack
 
 # Import Official MCP SDK - Streamable HTTP
-from mcp import ClientSession, types
+from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from models import (

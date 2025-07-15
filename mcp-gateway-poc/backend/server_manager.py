@@ -37,7 +37,6 @@ class ServerManager:
         """Initialize server manager and connect to configured Streamable HTTP servers"""
         logger.info("Initializing Server Manager with Streamable HTTP Protocol")
         logger.info(f"Protocol: {self.protocol_info['protocol']}, Transport: {self.protocol_info['transport']}")
-        logger.info("Note: SSE transport deprecated as of June 2025 - using Streamable HTTP")
         
         # Load servers from configuration
         for server_config in config.backend_servers:
